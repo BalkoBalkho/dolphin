@@ -754,6 +754,7 @@ if (USE_RETRO_ACHIEVEMENTS)
 endif()
 
 add_subdirectory(Externals/watcher)
+add_subdirectory(Externals/A642A64)
 
 # Any other platform or BSD is currently unsupported by cpp-ipc
 if(WIN32 OR LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "QNX")

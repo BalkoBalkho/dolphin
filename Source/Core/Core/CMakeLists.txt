@@ -519,6 +519,10 @@ add_library(core
   PowerPC/CachedInterpreter/CachedInterpreterBlockCache.h
   PowerPC/CachedInterpreter/CachedInterpreterEmitter.cpp
   PowerPC/CachedInterpreter/CachedInterpreterEmitter.h
+  PowerPC/StencilInterpreter/StencilInterpreter.cpp
+  PowerPC/StencilInterpreter/StencilInterpreter.h
+  PowerPC/StencilInterpreter/StencilInterpreterBlockCache.cpp
+  PowerPC/StencilInterpreter/StencilInterpreterBlockCache.h
   PowerPC/ConditionRegister.cpp
   PowerPC/ConditionRegister.h
   PowerPC/Expression.cpp
@@ -848,6 +852,8 @@ if(MSVC)
   # Add precompiled header
   target_link_libraries(core PRIVATE use_pch)
 endif()
+
+target_link_libraries(core PRIVATE A642A64)
 
 if(USE_RETRO_ACHIEVEMENTS)
   target_link_libraries(core PUBLIC rcheevos)
