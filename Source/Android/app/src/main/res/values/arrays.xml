@@ -28,19 +28,23 @@
     </integer-array>
     <string-array name="emuCoresEntriesARM64">
         <item>@string/jit_recompiler_arm64</item>
+        <item>@string/stencil_interpreter</item>
         <item>@string/cached_interpreter_slower</item>
         <item>@string/interpreter_slowest</item>
     </string-array>
     <integer-array name="emuCoresValuesARM64">
         <item>4</item>
+        <item>6</item>
         <item>5</item>
         <item>0</item>
     </integer-array>
     <string-array name="emuCoresEntriesGeneric">
+        <item>@string/stencil_interpreter</item>
         <item>@string/cached_interpreter</item>
         <item>@string/interpreter</item>
     </string-array>
     <integer-array name="emuCoresValuesGeneric">
+        <item>6</item>
         <item>5</item>
         <item>0</item>
     </integer-array>

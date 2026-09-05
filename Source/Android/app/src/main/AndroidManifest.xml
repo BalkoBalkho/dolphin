@@ -93,7 +93,7 @@
 
         <activity
             android:name=".activities.EmulationActivity"
-            android:exported="false"
+            android:exported="true"
             android:theme="@style/Theme.Dolphin.Main"
             android:preferMinimalPostProcessing="true"/>
 

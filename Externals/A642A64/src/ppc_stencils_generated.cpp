@@ -21114,3 +21114,4 @@ const StencilEntry* lookup_stencil(uint32_t opcode, uint32_t subop, bool Rc,
 
 size_t get_total_stencil_count() { return 15100; }
 size_t get_total_stencil_bytes() { return sizeof(g_stencil_pool); }
+const uint8_t* get_stencil_pool_base() { return g_stencil_pool; }

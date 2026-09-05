@@ -216,3 +216,4 @@ const StencilEntry* lookup_stencil(uint32_t opcode, uint32_t subop, bool Rc,
 // Helper: count total stencils
 size_t get_total_stencil_count();
 size_t get_total_stencil_bytes();
+const uint8_t* get_stencil_pool_base();

@@ -201,6 +201,11 @@ static void DoState(Core::System& system, PointerWrap& p)
 #endif  // USE_RETRO_ACHIEVEMENTS
 }
 
+static bool CheckIfStateSaveIsAllowed(Core::System& system)
+{
+  return Core::IsRunningOrStarting(system);
+}
+
 static bool CheckIfStateLoadIsAllowed(Core::System& system)
 {
   if (!Core::IsRunningOrStarting(system))
@@ -498,6 +503,9 @@ static void SaveAsFromCore(Core::System& system, std::string filename)
 
 void SaveAs(Core::System& system, std::string filename)
 {
+  if (!CheckIfStateSaveIsAllowed(system))
+    return;
+
   Core::RunOnCPUThread(
       system, [&system, filename = std::move(filename), lock = GetStateSaveTaskLock()]() mutable {
         SaveAsFromCore(system, std::move(filename));

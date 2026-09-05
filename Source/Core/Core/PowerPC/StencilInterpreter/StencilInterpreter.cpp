@@ -3,9 +3,14 @@
 
 #include "Core/PowerPC/StencilInterpreter/StencilInterpreter.h"
 
+#include <cstring>
 #include <span>
 #include <sstream>
 #include <utility>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 
 #include <fmt/ostream.h>
 
@@ -25,12 +30,21 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "ppc_stencils_generated.h"
-#include "Interpreter.h"
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+extern "C" void a642a64_run_stencil(
+    const void* stencil_bytes,
+    void* tape,
+    void* ppc_state,
+    void* mem_base,
+    uint32_t* pinned_gprs
+);
+extern "C" void a642a64_stencil_exit();
+#endif
 
 namespace
 {
 // Helper to map PPC GPR index to pinned index (0->r0, 1->r3, 2->r4, 3->r5, 4->r31)
-// Returns -1 if not a pinned register
 constexpr int GetPinnedIndex(u32 gpr)
 {
   switch (gpr)
@@ -43,20 +57,6 @@ constexpr int GetPinnedIndex(u32 gpr)
   default: return -1;
   }
 }
-
-// Convert pinned index to ARM64 register index
-constexpr int PinnedToARM64Reg(int p_idx)
-{
-  switch (p_idx)
-  {
-  case 0: return 23; // r0 -> X23
-  case 1: return 21; // r3 -> X21
-  case 2: return 22; // r4 -> X22
-  case 3: return 24; // r5 -> X24
-  case 4: return 25; // r31 -> X25
-  default: return 0;
-  }
-}
 }  // namespace
 
 StencilInterpreter::StencilInterpreter(Core::System& system)
@@ -64,7 +64,10 @@ StencilInterpreter::StencilInterpreter(Core::System& system)
 {
 }
 
-StencilInterpreter::~StencilInterpreter() = default;
+StencilInterpreter::~StencilInterpreter()
+{
+  Shutdown();
+}
 
 void StencilInterpreter::Init()
 {
@@ -72,6 +75,27 @@ void StencilInterpreter::Init()
 
   AllocCodeSpace(CODE_SIZE);
   ResetFreeMemoryRanges();
+
+  // Allocate an executable memory region for the stencil binary pool (RX)
+  m_exec_stencil_pool_size = get_total_stencil_bytes();
+  if (m_exec_stencil_pool_size > 0 && !m_exec_stencil_pool)
+  {
+#if defined(__unix__) || defined(__APPLE__)
+    m_exec_stencil_pool = static_cast<u8*>(mmap(
+        nullptr, m_exec_stencil_pool_size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (m_exec_stencil_pool != MAP_FAILED)
+    {
+      std::memcpy(m_exec_stencil_pool, get_stencil_pool_base(), m_exec_stencil_pool_size);
+      mprotect(m_exec_stencil_pool, m_exec_stencil_pool_size, PROT_READ | PROT_EXEC);
+    }
+    else
+    {
+      m_exec_stencil_pool = nullptr;
+    }
+#endif
+  }
 
   jo.enableBlocklink = false;
 
@@ -85,6 +109,27 @@ void StencilInterpreter::Init()
 void StencilInterpreter::Shutdown()
 {
   m_block_cache.Shutdown();
+  if (m_exec_stencil_pool)
+  {
+#if defined(__unix__) || defined(__APPLE__)
+    munmap(m_exec_stencil_pool, m_exec_stencil_pool_size);
+#endif
+    m_exec_stencil_pool = nullptr;
+    m_exec_stencil_pool_size = 0;
+  }
+}
+
+const u8* StencilInterpreter::GetExecutableStencilBytes(const StencilEntry* s)
+{
+  if (!s || !s->bytes)
+    return nullptr;
+  if (m_exec_stencil_pool)
+  {
+    const ptrdiff_t offset = s->bytes - get_stencil_pool_base();
+    if (offset >= 0 && static_cast<size_t>(offset) < m_exec_stencil_pool_size)
+      return m_exec_stencil_pool + offset;
+  }
+  return s->bytes;
 }
 
 void StencilInterpreter::ExecuteOneBlock()
@@ -101,7 +146,6 @@ void StencilInterpreter::ExecuteOneBlock()
   {
     const auto callback = *reinterpret_cast<const AnyCallback*>(normal_entry);
     const u8* payload = normal_entry + sizeof(callback);
-    // Direct dispatch to the most commonly used callbacks for better performance
     if (callback == AnyCallbackCast(Interpret<false>)) [[likely]]
     {
       Interpret<false>(ppc_state, *reinterpret_cast<const InterpretOperands*>(payload));
@@ -139,8 +183,6 @@ void StencilInterpreter::Run()
   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
   while (*state_ptr == CPU::State::Running)
   {
-    // Start new timing slice
-    // NOTE: Exceptions may change PC
     core_timing.Advance();
 
     do
@@ -152,7 +194,6 @@ void StencilInterpreter::Run()
 
 void StencilInterpreter::SingleStep()
 {
-  // Enter new timing slice
   m_system.GetCoreTiming().Advance();
   ExecuteOneBlock();
 }
@@ -222,35 +263,32 @@ s32 StencilInterpreter::ExecuteStencil(PowerPC::PowerPCState& ppc_state,
   }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-  // Direct native stencil invocation when running on ARM64 host
-  // Tape layout matching gen_stencils ABI:
-  // tape[0] = 0 (entry)
-  // tape[1] = operand_arg (imm32 / second op)
-  // tape[2] = return address / terminator
-  alignas(16) static const uint32_t kRetStub[2] = {0xd65f03c0, 0xd65f03c0}; // RET, RET
-  alignas(16) uint64_t tape[4] = {0, operands.operand_arg, reinterpret_cast<uint64_t>(kRetStub), 0};
+  // Tape layout:
+  // tape[0] = 0
+  // tape[1] = operands.operand_arg (imm32)
+  // tape[2] = a642a64_stencil_exit (the return point for the stencil tail-call: LDR X16,[X20,#16]!; BR X16)
+  alignas(16) uint64_t tape[4] = {
+      0,
+      operands.operand_arg,
+      reinterpret_cast<uint64_t>(&a642a64_stencil_exit),
+      0};
 
-  alignas(16) VMState vm_state{};
-  // Load pinned registers into VMState
+  uint32_t pinned[5] = {
+      ppc_state.gpr[kPinnedRegs[0]],
+      ppc_state.gpr[kPinnedRegs[1]],
+      ppc_state.gpr[kPinnedRegs[2]],
+      ppc_state.gpr[kPinnedRegs[3]],
+      ppc_state.gpr[kPinnedRegs[4]],
+  };
+
+  a642a64_run_stencil(operands.exec_bytes, tape, &ppc_state, ppc_state.mem_ptr, pinned);
+
+  // Synchronize back
   for (int i = 0; i < 5; ++i)
-  {
-    const int arm_reg = PinnedToARM64Reg(i);
-    vm_state.regs[arm_reg] = ppc_state.gpr[kPinnedRegs[i]];
-  }
-  vm_state.regs[20] = reinterpret_cast<uint64_t>(tape);
-  vm_state.regs[28] = reinterpret_cast<uint64_t>(ppc_state.mem_ptr);
+    ppc_state.gpr[kPinnedRegs[i]] = pinned[i];
 
-  using StencilFunc = void (*)(VMState*);
-  reinterpret_cast<StencilFunc>(const_cast<uint8_t*>(operands.stencil->bytes))(&vm_state);
-
-  // Sync pinned registers back to ppc_state
-  for (int i = 0; i < 5; ++i)
-  {
-    const int arm_reg = PinnedToARM64Reg(i);
-    ppc_state.gpr[kPinnedRegs[i]] = static_cast<u32>(vm_state.regs[arm_reg]);
-  }
 #else
-  // Non-ARM64 fallback: execute simple ALU/logic ops directly using the operand information
+  // Non-ARM64 fallback: emulate ALU operations directly
   if (operands.ra_gpr < 32 && operands.rd_gpr < 32)
   {
     u32 ra_val = (operands.ra_gpr == 0) ? 0 : ppc_state.gpr[operands.ra_gpr];
@@ -490,7 +528,7 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
         if (s != nullptr && s->bytes != nullptr && s->length > 0)
         {
           const StencilOperands stencil_ops = {
-              s,
+              GetExecutableStencilBytes(s),
               js.compilerPC,
               static_cast<u32>(static_cast<s32>(op.inst.SIMM_16)),
               op.inst.RD,
@@ -508,7 +546,7 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
         if (s != nullptr && s->bytes != nullptr && s->length > 0)
         {
           const StencilOperands stencil_ops = {
-              s,
+              GetExecutableStencilBytes(s),
               js.compilerPC,
               static_cast<u32>(static_cast<s32>(op.inst.SIMM_16) << 16),
               op.inst.RD,
@@ -526,7 +564,7 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
         if (s != nullptr && s->bytes != nullptr && s->length > 0)
         {
           const StencilOperands stencil_ops = {
-              s, js.compilerPC, 0, op.inst.RD, op.inst.RA, op.inst.RB};
+              GetExecutableStencilBytes(s), js.compilerPC, 0, op.inst.RD, op.inst.RA, op.inst.RB};
           Write(op.canEndBlock ? CallbackCast(ExecuteStencil<true>) :
                                  CallbackCast(ExecuteStencil<false>),
                 stencil_ops);
@@ -539,7 +577,7 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
         if (s != nullptr && s->bytes != nullptr && s->length > 0)
         {
           const StencilOperands stencil_ops = {
-              s, js.compilerPC, 0, op.inst.RD, op.inst.RA, op.inst.RB};
+              GetExecutableStencilBytes(s), js.compilerPC, 0, op.inst.RD, op.inst.RA, op.inst.RB};
           Write(op.canEndBlock ? CallbackCast(ExecuteStencil<true>) :
                                  CallbackCast(ExecuteStencil<false>),
                 stencil_ops);

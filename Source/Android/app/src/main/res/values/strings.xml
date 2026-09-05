@@ -700,6 +700,7 @@ It can efficiently compress both junk data and encrypted Wii data.
     <string name="jit_recompiler_arm64">JIT Recompiler for ARM64 (recommended)</string>
     <string name="cached_interpreter_slower">Cached Interpreter (slower)</string>
     <string name="cached_interpreter">Cached Interpreter</string>
+    <string name="stencil_interpreter">Stencil Interpreter (Experimental)</string>
     <string name="interpreter_slowest">Interpreter (slowest)</string>
     <string name="interpreter">Interpreter</string>
 

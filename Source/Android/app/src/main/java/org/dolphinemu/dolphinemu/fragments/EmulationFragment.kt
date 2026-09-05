@@ -261,7 +261,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
         }
     }
 
-    fun saveTemporaryState() = NativeLibrary.SaveStateAs(temporaryStateFilePath)
+    fun saveTemporaryState() {
+        if (NativeLibrary.IsRunning()) {
+            NativeLibrary.SaveStateAs(temporaryStateFilePath)
+        }
+    }
 
     private val temporaryStateFilePath: String
         get() = "${requireContext().filesDir}${File.separator}temp.sav"

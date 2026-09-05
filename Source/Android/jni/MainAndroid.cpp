@@ -308,25 +308,37 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_eglBindAPI(J
 JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SaveState(JNIEnv*, jclass,
                                                                               jint slot)
 {
-  State::Save(Core::System::GetInstance(), slot);
+  auto& system = Core::System::GetInstance();
+  if (!Core::IsRunning(system))
+    return;
+  State::Save(system, slot);
 }
 
 JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SaveStateAs(JNIEnv* env, jclass,
                                                                                 jstring path)
 {
-  State::SaveAs(Core::System::GetInstance(), GetJString(env, path));
+  auto& system = Core::System::GetInstance();
+  if (!Core::IsRunning(system))
+    return;
+  State::SaveAs(system, GetJString(env, path));
 }
 
 JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_LoadState(JNIEnv*, jclass,
                                                                               jint slot)
 {
-  State::Load(Core::System::GetInstance(), slot);
+  auto& system = Core::System::GetInstance();
+  if (!Core::IsRunning(system))
+    return;
+  State::Load(system, slot);
 }
 
 JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_LoadStateAs(JNIEnv* env, jclass,
                                                                                 jstring path)
 {
-  State::LoadAs(Core::System::GetInstance(), GetJString(env, path));
+  auto& system = Core::System::GetInstance();
+  if (!Core::IsRunning(system))
+    return;
+  State::LoadAs(system, GetJString(env, path));
 }
 
 JNIEXPORT jlong JNICALL

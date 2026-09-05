@@ -8,7 +8,7 @@ set(A642A64_SOURCES
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   enable_language(ASM)
-  list(APPEND A642A64_SOURCES src/Interpreter.S)
+  list(APPEND A642A64_SOURCES src/Interpreter.S src/stencil_trampoline.S)
 endif()
 
 add_library(A642A64 STATIC ${A642A64_SOURCES})

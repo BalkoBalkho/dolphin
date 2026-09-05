@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <vector>
 
 #include "Common/CommonTypes.h"
 #include "Common/RangeSizeSet.h"
@@ -58,6 +59,8 @@ public:
   const char* GetName() const override { return "Stencil Interpreter"; }
   const CommonAsmRoutinesBase* GetAsmRoutines() override { return nullptr; }
 
+  const u8* GetExecutableStencilBytes(const StencilEntry* s);
+
 private:
   void ExecuteOneBlock();
 
@@ -102,6 +105,9 @@ private:
 
   Common::RangeSizeSet<u8*> m_free_ranges;
   StencilInterpreterBlockCache m_block_cache;
+
+  u8* m_exec_stencil_pool = nullptr;
+  size_t m_exec_stencil_pool_size = 0;
 };
 
 struct StencilInterpreter::StartProfiledBlockOperands
@@ -140,7 +146,7 @@ struct StencilInterpreter::InterpretAndCheckExceptionsOperands : InterpretOperan
 
 struct StencilInterpreter::StencilOperands
 {
-  const StencilEntry* stencil;
+  const u8* exec_bytes;
   u32 current_pc;
   u32 operand_arg;  // immediate or secondary operand for the stencil
   u32 rd_gpr;
