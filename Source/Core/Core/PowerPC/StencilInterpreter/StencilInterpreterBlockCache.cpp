@@ -29,9 +29,16 @@ void StencilInterpreterBlockCache::ClearRangesToFree()
   m_ranges_to_free_on_next_codegen.clear();
 }
 
+#include <cstring>
+
 void StencilInterpreterBlockCache::WriteLinkBlock(const JitBlock::LinkData& source,
                                                   const JitBlock* dest)
 {
+  if (source.exitPtrs)
+  {
+    const u8* target = dest ? dest->normalEntry : nullptr;
+    std::memcpy(source.exitPtrs, &target, sizeof(target));
+  }
 }
 
 void StencilInterpreterBlockCache::WriteDestroyBlock(const JitBlock& block)

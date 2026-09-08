@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <vector>
 
@@ -80,10 +81,25 @@ private:
   struct InterpretOperands;
   struct InterpretAndCheckExceptionsOperands;
   struct StencilOperands;
+  struct TapeRunOperands;
   struct HLEFunctionOperands;
   struct WriteBrokenBlockNPCOperands;
   struct CheckHaltOperands;
   struct CheckIdleOperands;
+  struct BlockLinkDirectOperands;
+  struct BlockLinkBranchOperands;
+
+  struct StencilTapeItem
+  {
+    const u8* code;
+    uint64_t operand;
+    u32 pc;
+    bool canEndBlock;
+  };
+
+  void EmitTapeRun(const std::vector<StencilTapeItem>& run, u32 pc);
+  std::optional<StencilTapeItem> TryEmitStencil(const PPCAnalyst::CodeOp& op);
+  bool TryWriteBlockEnd(const PPCAnalyst::CodeOp& op, JitBlock* b);
 
   static s32 StartProfiledBlock(PowerPC::PowerPCState& ppc_state,
                                 const StartProfiledBlockOperands& operands);
@@ -96,6 +112,12 @@ private:
                                          const InterpretAndCheckExceptionsOperands& operands);
   template <bool write_pc>
   static s32 ExecuteStencil(PowerPC::PowerPCState& ppc_state, const StencilOperands& operands);
+  template <bool write_pc>
+  static s32 ExecuteTapeRun(PowerPC::PowerPCState& ppc_state, const void* payload);
+  static s32 ExecuteBlockLinkDirect(PowerPC::PowerPCState& ppc_state,
+                                    const BlockLinkDirectOperands& operands);
+  static s32 ExecuteBlockLinkBranch(PowerPC::PowerPCState& ppc_state,
+                                    const BlockLinkBranchOperands& operands);
   static s32 HLEFunction(PowerPC::PowerPCState& ppc_state, const HLEFunctionOperands& operands);
   static s32 WriteBrokenBlockNPC(PowerPC::PowerPCState& ppc_state,
                                  const WriteBrokenBlockNPCOperands& operands);
@@ -108,6 +130,26 @@ private:
 
   u8* m_exec_stencil_pool = nullptr;
   size_t m_exec_stencil_pool_size = 0;
+
+  // Benchmark stats
+  u64 m_bench_last_time_ms = 0;
+  u64 m_bench_blocks_executed = 0;
+  s64 m_bench_last_downcount = 0;
+  s64 m_bench_last_ticks = 0;
+
+  struct BlockTraceEntry
+  {
+    u32 start_pc = 0;
+    u32 end_pc = 0;
+    u32 lr = 0;
+    u32 ctr = 0;
+    u32 r3 = 0;
+    u32 r12 = 0;
+    u32 stencils_executed = 0;
+    u32 interprets_executed = 0;
+  };
+  std::array<BlockTraceEntry, 32> m_block_history{};
+  size_t m_block_history_index = 0;
 };
 
 struct StencilInterpreter::StartProfiledBlockOperands
@@ -155,6 +197,14 @@ struct StencilInterpreter::StencilOperands
   u32 : 32;
 };
 
+struct StencilInterpreter::TapeRunOperands
+{
+  const u8* first_stencil;
+  u32 tape_num_entries;
+  u32 current_pc;
+  u32 : 32;
+};
+
 struct StencilInterpreter::HLEFunctionOperands
 {
   Core::System& system;
@@ -179,4 +229,25 @@ struct StencilInterpreter::CheckIdleOperands
 {
   CoreTiming::CoreTimingManager& core_timing;
   u32 idle_pc;
+};
+
+struct StencilInterpreter::BlockLinkDirectOperands
+{
+  const u8* target_normal_entry;
+  u32 destination;
+  u32 downcount_amount;
+  u32 num_load_stores;
+  u32 num_fp_inst;
+};
+
+struct StencilInterpreter::BlockLinkBranchOperands
+{
+  const u8* taken_normal_entry;
+  const u8* fallthrough_normal_entry;
+  u32 taken_destination;
+  u32 fallthrough_destination;
+  u32 downcount_amount;
+  u32 num_load_stores;
+  u32 num_fp_inst;
+  UGeckoInstruction inst;
 };

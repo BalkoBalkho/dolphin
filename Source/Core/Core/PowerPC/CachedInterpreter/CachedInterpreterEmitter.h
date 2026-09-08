@@ -87,8 +87,9 @@ public:
   static s32 PoisonCallback(PowerPC::PowerPCState& ppc_state, const void* operands);
   static s32 PoisonCallback(std::ostream& stream, const void* operands);
 
-private:
   void Write(AnyCallback callback, const void* operands, std::size_t size);
+
+private:
 
   // Pointer to memory where code will be emitted to.
   u8* m_code = nullptr;
