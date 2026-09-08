@@ -156,7 +156,7 @@ enum class BooleanSetting(
         Settings.FILE_DOLPHIN,
         Settings.SECTION_INI_INTERFACE,
         "UsePanicHandlers",
-        true
+        false
     ),
     MAIN_OSD_MESSAGES(
         Settings.FILE_DOLPHIN,
