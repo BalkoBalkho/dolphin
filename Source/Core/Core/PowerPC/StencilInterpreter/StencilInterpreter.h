@@ -62,6 +62,44 @@ public:
 
   const u8* GetExecutableStencilBytes(const StencilEntry* s);
 
+  struct TapeTargetLink
+  {
+    const void* first_stencil;  // offset 0
+    const void* tape_cursor;    // offset 8
+  };
+
+  struct TapeDirectLinkData
+  {
+    TapeTargetLink target;      // offset 0..15
+    u32 destination_pc;         // offset 16
+    u32 downcount_cycles;       // offset 20
+  };
+
+  struct TapeCondBranchLinkData
+  {
+    TapeTargetLink taken;            // offset 0..15
+    u32 taken_destination_pc;        // offset 16
+    u32 downcount_cycles;            // offset 20
+
+    TapeTargetLink fallthrough;      // offset 24..39
+    u32 fallthrough_destination_pc;  // offset 40
+    u32 pad;                         // offset 44
+
+    u32 bo;                          // offset 48
+    u32 bi;                          // offset 52
+  };
+
+  struct TapeRunOperands
+  {
+    const u8* first_stencil;
+    u32 tape_num_entries;
+    u32 current_pc;
+    u32 : 32;
+  };
+
+  template <bool write_pc>
+  static s32 ExecuteTapeRun(PowerPC::PowerPCState& ppc_state, const void* payload);
+
 private:
   void ExecuteOneBlock();
 
@@ -81,7 +119,6 @@ private:
   struct InterpretOperands;
   struct InterpretAndCheckExceptionsOperands;
   struct StencilOperands;
-  struct TapeRunOperands;
   struct HLEFunctionOperands;
   struct WriteBrokenBlockNPCOperands;
   struct CheckHaltOperands;
@@ -98,6 +135,7 @@ private:
   };
 
   void EmitTapeRun(const std::vector<StencilTapeItem>& run, u32 pc);
+  bool TryEmitTapeBranch(const PPCAnalyst::CodeOp& op, JitBlock* b, std::vector<StencilTapeItem>& tape_run);
   std::optional<StencilTapeItem> TryEmitStencil(const PPCAnalyst::CodeOp& op);
   bool TryWriteBlockEnd(const PPCAnalyst::CodeOp& op, JitBlock* b);
 
@@ -112,8 +150,6 @@ private:
                                          const InterpretAndCheckExceptionsOperands& operands);
   template <bool write_pc>
   static s32 ExecuteStencil(PowerPC::PowerPCState& ppc_state, const StencilOperands& operands);
-  template <bool write_pc>
-  static s32 ExecuteTapeRun(PowerPC::PowerPCState& ppc_state, const void* payload);
   static s32 ExecuteBlockLinkDirect(PowerPC::PowerPCState& ppc_state,
                                     const BlockLinkDirectOperands& operands);
   static s32 ExecuteBlockLinkBranch(PowerPC::PowerPCState& ppc_state,
@@ -194,14 +230,6 @@ struct StencilInterpreter::StencilOperands
   u32 rd_gpr;
   u32 ra_gpr;
   u32 rb_gpr;
-  u32 : 32;
-};
-
-struct StencilInterpreter::TapeRunOperands
-{
-  const u8* first_stencil;
-  u32 tape_num_entries;
-  u32 current_pc;
   u32 : 32;
 };
 

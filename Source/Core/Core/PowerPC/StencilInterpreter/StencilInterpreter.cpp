@@ -21,6 +21,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/Debugger/DivergenceTracer.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
@@ -59,6 +60,7 @@ constexpr int GetPinnedIndex(u32 gpr)
 static_assert(offsetof(PowerPC::PowerPCState, gpr) == 32, "GPR offset must be 32 for stencil_trampoline.S");
 static_assert(offsetof(PowerPC::PowerPCState, cr.fields) == 672, "CR offset must be 672 for stencil_trampoline.S");
 static_assert(offsetof(PowerPC::PowerPCState, xer_so_ov) == 757, "xer_so_ov offset must be 757 for stencil_trampoline.S");
+static_assert(offsetof(PowerPC::PowerPCState, spr[SPR_CTR]) == 868, "CTR offset must be 868 for stencil_trampoline.S");
 #pragma GCC diagnostic pop
 #endif
 }  // namespace
@@ -80,6 +82,24 @@ uint32_t Stencil_SlowReadU16(PowerPC::PowerPCState* ppc_state, uint32_t addr)
 uint32_t Stencil_SlowReadU32(PowerPC::PowerPCState* ppc_state, uint32_t addr)
 {
   return s_system_instance ? s_system_instance->GetMMU().Read<u32>(addr) : 0;
+}
+
+void Stencil_SlowWriteU8(PowerPC::PowerPCState* ppc_state, uint32_t addr, uint32_t val)
+{
+  if (s_system_instance)
+    s_system_instance->GetMMU().Write<u8>(val, addr);
+}
+
+void Stencil_SlowWriteU16(PowerPC::PowerPCState* ppc_state, uint32_t addr, uint32_t val)
+{
+  if (s_system_instance)
+    s_system_instance->GetMMU().Write<u16>(val, addr);
+}
+
+void Stencil_SlowWriteU32(PowerPC::PowerPCState* ppc_state, uint32_t addr, uint32_t val)
+{
+  if (s_system_instance)
+    s_system_instance->GetMMU().Write<u32>(val, addr);
 }
 }
 #endif
@@ -217,7 +237,7 @@ void StencilInterpreter::ExecuteOneBlock()
       ExecuteTapeRun<true>(ppc_state, payload);
       const auto* operands = reinterpret_cast<const TapeRunOperands*>(payload);
       stencils_executed += operands->tape_num_entries;
-      normal_entry = payload + sizeof(TapeRunOperands) + operands->tape_num_entries * sizeof(uint64_t);
+      break;
     }
     else if (callback == AnyCallbackCast(ExecuteBlockLinkBranch))
     {
@@ -442,6 +462,36 @@ void StencilInterpreter::ExecuteOneBlock()
         trace_file.close();
     }
   }
+  if (start_pc == 0x800040f0)
+  {
+    static bool logged_40f0 = false;
+    if (!logged_40f0)
+    {
+      logged_40f0 = true;
+      WARN_LOG_FMT(POWERPC, "=== HIT 0x800040f0! MSR={:08x} LR={:08x} CTR={:08x} ===",
+                   m_ppc_state.msr.Hex, m_ppc_state.spr[SPR_LR], m_ppc_state.spr[SPR_CTR]);
+      for (int i = 0; i < 32; i += 4)
+      {
+        WARN_LOG_FMT(POWERPC, "  r{:02d}={:08x} r{:02d}={:08x} r{:02d}={:08x} r{:02d}={:08x}",
+                     i, m_ppc_state.gpr[i],
+                     i + 1, m_ppc_state.gpr[i + 1],
+                     i + 2, m_ppc_state.gpr[i + 2],
+                     i + 3, m_ppc_state.gpr[i + 3]);
+      }
+      WARN_LOG_FMT(POWERPC, "=== DISASSEMBLY OF 0x800040c0..0x80004120 ===");
+      for (u32 a = 0x800040c0; a <= 0x80004120; a += 4)
+      {
+        const u8* ptr = m_system.GetMemory().GetPointerForRange(a, 4);
+        if (ptr)
+        {
+          u32 opc = Common::swap32(*reinterpret_cast<const u32*>(ptr));
+          WARN_LOG_FMT(POWERPC, "  {:08x}: {:08x} -> {}{}", a, opc, Common::GekkoDisassembler::Disassemble(opc, a),
+                       a == start_pc ? " <== 800040F0" : "");
+        }
+      }
+    }
+  }
+
   if (start_pc == 0x8015e780)
   {
     static int mtmsr_count = 0;
@@ -567,6 +617,10 @@ s32 StencilInterpreter::EndBlock(PowerPC::PowerPCState& ppc_state,
                                     operands.num_fp_inst, ppc_state);
   if constexpr (profiled)
     JitBlock::ProfileData::EndProfiling(operands.profile_data, operands.downcount);
+
+  if (DivergenceTracer::IsBlockTracingEnabled())
+    DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
+
   return 0;
 }
 
@@ -599,6 +653,8 @@ s32 StencilInterpreter::InterpretAndCheckExceptions(
     ppc_state.pc = operands.current_pc;
     ppc_state.downcount -= operands.downcount;
     operands.power_pc.CheckExceptions();
+    if (DivergenceTracer::IsBlockTracingEnabled())
+      DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
     return 0;
   }
   return sizeof(AnyCallback) + sizeof(operands);
@@ -656,6 +712,9 @@ s32 StencilInterpreter::ExecuteTapeRun(PowerPC::PowerPCState& ppc_state, const v
                       s_system_instance->GetMemory().GetRAM(), &ppc_state.downcount);
 #endif
 
+  if constexpr (write_pc)
+    return 0;
+
   return static_cast<s32>(sizeof(AnyCallback) + sizeof(TapeRunOperands) +
                           operands->tape_num_entries * sizeof(uint64_t));
 }
@@ -701,6 +760,160 @@ void StencilInterpreter::EmitTapeRun(const std::vector<StencilTapeItem>& run, u3
   Write(can_end ? AnyCallbackCast(ExecuteTapeRun<true>) :
                   AnyCallbackCast(ExecuteTapeRun<false>),
         payload.data(), total_payload_size);
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+static_assert(sizeof(StencilInterpreter::TapeTargetLink) == 16);
+static_assert(offsetof(StencilInterpreter::TapeDirectLinkData, target.first_stencil) == 0);
+static_assert(offsetof(StencilInterpreter::TapeDirectLinkData, target.tape_cursor) == 8);
+static_assert(offsetof(StencilInterpreter::TapeDirectLinkData, destination_pc) == 16);
+static_assert(offsetof(StencilInterpreter::TapeDirectLinkData, downcount_cycles) == 20);
+
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, taken.first_stencil) == 0);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, taken.tape_cursor) == 8);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, taken_destination_pc) == 16);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, downcount_cycles) == 20);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, fallthrough.first_stencil) == 24);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, fallthrough.tape_cursor) == 32);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, fallthrough_destination_pc) == 40);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, bo) == 48);
+static_assert(offsetof(StencilInterpreter::TapeCondBranchLinkData, bi) == 52);
+#endif
+
+bool StencilInterpreter::TryEmitTapeBranch(const PPCAnalyst::CodeOp& op, JitBlock* b,
+                                           std::vector<StencilTapeItem>& tape_run)
+{
+  return false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+  if (!jo.enableBlocklink || op.branchIsIdleLoop || IsProfilingEnabled() || b == nullptr)
+    return false;
+
+  const u32 primary_op = op.inst.OPCD;
+  const bool is_direct = (primary_op == 18 && op.inst.LK == 0);
+  const bool is_cond = (primary_op == 16 && op.inst.LK == 0);
+
+  if (!is_direct && !is_cond)
+    return false;
+
+  const size_t M = tape_run.size();
+  const size_t num_words = 2 * (M + 1);
+
+  const u8* current_code = GetWritableCodePtr();
+  u8* payload_base = const_cast<u8*>(current_code) + sizeof(AnyCallback);
+  const size_t tape_bytes = num_words * sizeof(uint64_t);
+
+  std::vector<uint64_t> tape(num_words, 0);
+
+  if (M > 0)
+  {
+    tape[0] = 0;
+    tape[1] = tape_run[0].operand;
+    for (size_t k = 1; k < M; ++k)
+    {
+      tape[2 * k] = reinterpret_cast<uint64_t>(tape_run[k].code);
+      tape[2 * k + 1] = tape_run[k].operand;
+    }
+  }
+
+  const size_t branch_idx = M;
+
+  if (is_direct)
+  {
+    const size_t total_payload_size = sizeof(TapeRunOperands) + tape_bytes + sizeof(TapeDirectLinkData);
+    auto* link_data = reinterpret_cast<TapeDirectLinkData*>(
+        payload_base + sizeof(TapeRunOperands) + tape_bytes);
+
+    tape[2 * branch_idx] = (branch_idx == 0) ? 0 : reinterpret_cast<uint64_t>(&stencil_tape_direct_jump);
+    tape[2 * branch_idx + 1] = reinterpret_cast<uint64_t>(link_data);
+
+    const u8* first_stencil = (M > 0) ? tape_run[0].code :
+                                        reinterpret_cast<const u8*>(&stencil_tape_direct_jump);
+
+    TapeDirectLinkData link_data_init{
+        .target = {nullptr, nullptr},
+        .destination_pc = op.branchTo,
+        .downcount_cycles = js.downcountAmount,
+    };
+
+    TapeRunOperands header{
+        .first_stencil = first_stencil,
+        .tape_num_entries = static_cast<u32>(num_words),
+        .current_pc = op.address,
+    };
+
+    std::vector<u8> payload(total_payload_size);
+    std::memcpy(payload.data(), &header, sizeof(header));
+    std::memcpy(payload.data() + sizeof(header), tape.data(), tape_bytes);
+    std::memcpy(payload.data() + sizeof(header) + tape_bytes, &link_data_init, sizeof(link_data_init));
+
+    Write(AnyCallbackCast(ExecuteTapeRun<true>), payload.data(), total_payload_size);
+
+    JitBlock::LinkData link;
+    link.exitAddress = op.branchTo;
+    link.exitPtrs = reinterpret_cast<u8*>(&link_data->target);
+    link.exitFarcode = reinterpret_cast<const u8*>(1);
+    link.linkStatus = false;
+    link.call = false;
+    b->linkData.push_back(link);
+  }
+  else
+  {
+    const size_t total_payload_size = sizeof(TapeRunOperands) + tape_bytes + sizeof(TapeCondBranchLinkData);
+    auto* link_data = reinterpret_cast<TapeCondBranchLinkData*>(
+        payload_base + sizeof(TapeRunOperands) + tape_bytes);
+
+    tape[2 * branch_idx] = (branch_idx == 0) ? 0 : reinterpret_cast<uint64_t>(&stencil_tape_cond_branch);
+    tape[2 * branch_idx + 1] = reinterpret_cast<uint64_t>(link_data);
+
+    const u8* first_stencil = (M > 0) ? tape_run[0].code :
+                                        reinterpret_cast<const u8*>(&stencil_tape_cond_branch);
+
+    TapeCondBranchLinkData link_data_init{
+        .taken = {nullptr, nullptr},
+        .taken_destination_pc = op.branchTo,
+        .downcount_cycles = js.downcountAmount,
+        .fallthrough = {nullptr, nullptr},
+        .fallthrough_destination_pc = op.address + 4,
+        .pad = 0,
+        .bo = op.inst.BO,
+        .bi = op.inst.BI,
+    };
+
+    TapeRunOperands header{
+        .first_stencil = first_stencil,
+        .tape_num_entries = static_cast<u32>(num_words),
+        .current_pc = op.address,
+    };
+
+    std::vector<u8> payload(total_payload_size);
+    std::memcpy(payload.data(), &header, sizeof(header));
+    std::memcpy(payload.data() + sizeof(header), tape.data(), tape_bytes);
+    std::memcpy(payload.data() + sizeof(header) + tape_bytes, &link_data_init, sizeof(link_data_init));
+
+    Write(AnyCallbackCast(ExecuteTapeRun<true>), payload.data(), total_payload_size);
+
+    JitBlock::LinkData link_taken;
+    link_taken.exitAddress = op.branchTo;
+    link_taken.exitPtrs = reinterpret_cast<u8*>(&link_data->taken);
+    link_taken.exitFarcode = reinterpret_cast<const u8*>(1);
+    link_taken.linkStatus = false;
+    link_taken.call = false;
+    b->linkData.push_back(link_taken);
+
+    JitBlock::LinkData link_fallthrough;
+    link_fallthrough.exitAddress = op.address + 4;
+    link_fallthrough.exitPtrs = reinterpret_cast<u8*>(&link_data->fallthrough);
+    link_fallthrough.exitFarcode = reinterpret_cast<const u8*>(1);
+    link_fallthrough.linkStatus = false;
+    link_fallthrough.call = false;
+    b->linkData.push_back(link_fallthrough);
+  }
+
+  tape_run.clear();
+  return true;
+#else
+  return false;
+#endif
 }
 
 std::optional<StencilInterpreter::StencilTapeItem>
@@ -805,7 +1018,6 @@ StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
   if (primary_op == 31 && op.inst.Rc == 0)
   {
     const u32 subop = op.inst.SUBOP10;
-
     // cmp (0): Compare Signed
     if (subop == 0)
     {
@@ -852,6 +1064,7 @@ StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
                         (static_cast<uint64_t>(op.inst.RB) << 8);
       return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_or), packed, op.address, op.canEndBlock};
     }
+
     // and (28): RA = RS & RB
     if (subop == 28)
     {
@@ -953,6 +1166,36 @@ StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
                         static_cast<uint16_t>(simm);
       return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_lwz), packed, op.address, op.canEndBlock};
     }
+
+    // 14. stw (primary 36): [RA + SIMM_16] = RS
+    if (primary_op == 36)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_stw), packed, op.address, op.canEndBlock};
+    }
+
+    // 15. stb (primary 38): [RA + SIMM_16] = RS
+    if (primary_op == 38)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_stb), packed, op.address, op.canEndBlock};
+    }
+
+    // 16. sth (primary 44): [RA + SIMM_16] = RS
+    if (primary_op == 44)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_sth), packed, op.address, op.canEndBlock};
+    }
   }
 
 #endif
@@ -987,6 +1230,8 @@ s32 StencilInterpreter::CheckFPU(PowerPC::PowerPCState& ppc_state,
     ppc_state.downcount -= downcount;
     ppc_state.Exceptions |= EXCEPTION_FPU_UNAVAILABLE;
     power_pc.CheckExceptions();
+    if (DivergenceTracer::IsBlockTracingEnabled())
+      DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
     return 0;
   }
   return sizeof(AnyCallback) + sizeof(operands);
@@ -1000,6 +1245,8 @@ s32 StencilInterpreter::CheckBreakpoint(PowerPC::PowerPCState& ppc_state,
   if (power_pc.CheckAndHandleBreakPoints())
   {
     power_pc.GetPPCState().downcount -= downcount;
+    if (DivergenceTracer::IsBlockTracingEnabled())
+      DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
     return 0;
   }
   return sizeof(AnyCallback) + sizeof(operands);
@@ -1052,6 +1299,9 @@ s32 StencilInterpreter::ExecuteBlockLinkDirect(PowerPC::PowerPCState& ppc_state,
   PowerPC::UpdatePerformanceMonitor(operands.downcount_amount, operands.num_load_stores,
                                     operands.num_fp_inst, ppc_state);
 
+  if (DivergenceTracer::IsBlockTracingEnabled())
+    DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
+
   if (ppc_state.downcount <= 0)
     return 0;
 
@@ -1086,32 +1336,40 @@ s32 StencilInterpreter::ExecuteBlockLinkBranch(PowerPC::PowerPCState& ppc_state,
   PowerPC::UpdatePerformanceMonitor(operands.downcount_amount, operands.num_load_stores,
                                     operands.num_fp_inst, ppc_state);
 
-  // 2-Block Ping-Pong Idle Loop Detection (e.g. A -> B -> A polling loop):
-  thread_local u32 tl_target1 = 0;
-  thread_local u32 tl_target2 = 0;
-  thread_local u32 tl_ping_pong_count = 0;
+  if (DivergenceTracer::IsBlockTracingEnabled())
+    DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
 
-  if (taken && destination == tl_target1)
+  // Safe Multi-Block Idle Loop Detection:
+  // Only applies when determinism is not requested (keeps lockstep test 100% deterministic),
+  // and strictly for blocks with <= 1 load and 0 stores/floats (ensuring compute/decompression loops are never skipped).
+  if (!Core::WantsDeterminism() && operands.num_load_stores <= 1 && operands.num_fp_inst == 0)
   {
-    if (++tl_ping_pong_count >= 16)
+    thread_local u32 tl_target1 = 0;
+    thread_local u32 tl_target2 = 0;
+    thread_local u32 tl_ping_pong_count = 0;
+
+    if (taken && destination == tl_target1)
+    {
+      if (++tl_ping_pong_count >= 64)
+      {
+        tl_ping_pong_count = 0;
+        if (s_system_instance)
+          s_system_instance->GetCoreTiming().Idle();
+        return 0;
+      }
+      tl_target1 = tl_target2;
+      tl_target2 = destination;
+    }
+    else if (taken)
+    {
+      tl_target1 = tl_target2;
+      tl_target2 = destination;
+      tl_ping_pong_count = 0;
+    }
+    else
     {
       tl_ping_pong_count = 0;
-      if (s_system_instance)
-        s_system_instance->GetCoreTiming().Idle();
-      return 0;
     }
-    tl_target1 = tl_target2;
-    tl_target2 = destination;
-  }
-  else if (taken)
-  {
-    tl_target1 = tl_target2;
-    tl_target2 = destination;
-    tl_ping_pong_count = 0;
-  }
-  else
-  {
-    tl_ping_pong_count = 0;
   }
 
   if (ppc_state.downcount <= 0)
@@ -1311,6 +1569,17 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
     }
   };
 
+  if (em_address >= 0x800380e0 && em_address <= 0x80038130)
+  {
+    WARN_LOG_FMT(POWERPC, "[IDLE_INSPECT] Block at 0x{:08x} (num_inst={}):", em_address, code_block.m_num_instructions);
+    for (u32 k = 0; k < code_block.m_num_instructions; ++k)
+    {
+      const auto& op_insp = m_code_buffer[k];
+      WARN_LOG_FMT(POWERPC, "    [{:08x}] {} (type={}, branchTo=0x{:08x}, isIdle={})",
+                   op_insp.address, op_insp.opinfo->opname, static_cast<int>(op_insp.opinfo->type), op_insp.branchTo, op_insp.branchIsIdleLoop);
+    }
+  }
+
   for (u32 i = 0; i < code_block.m_num_instructions; i++)
   {
     PPCAnalyst::CodeOp& op = m_code_buffer[i];
@@ -1352,12 +1621,18 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
       }
       else
       {
-        flush_tape_run();
-
-        if (op.canEndBlock && TryWriteBlockEnd(op, b))
+        if (op.canEndBlock && TryEmitTapeBranch(op, b, tape_run))
         {
-          // Combined branch condition evaluation + block link written directly!
+          // Emitted native tape branch chaining!
         }
+        else
+        {
+          flush_tape_run();
+
+          if (op.canEndBlock && TryWriteBlockEnd(op, b))
+          {
+            // Combined branch condition evaluation + block link written directly!
+          }
         else
         {
           if (IsDebuggingEnabled() && !cpu.IsStepping() &&
@@ -1399,6 +1674,7 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
       }
     }
   }
+}
 
   flush_tape_run();
   if (code_block.m_broken)

@@ -417,6 +417,13 @@ u32 CEXIIPL::GetEmulatedTime(Core::System& system, u32 epoch)
     // let's keep time moving forward, regardless of what it starts at
     ltime += system.GetCoreTiming().GetTicks() / system.GetSystemTimers().GetTicksPerSecond();
   }
+  else if (Config::Get(Config::MAIN_CUSTOM_RTC_ENABLE))
+  {
+    ltime = Config::Get(Config::MAIN_CUSTOM_RTC_VALUE);
+
+    // let's keep time moving forward, regardless of what it starts at
+    ltime += system.GetCoreTiming().GetTicks() / system.GetSystemTimers().GetTicksPerSecond();
+  }
   else
   {
     ASSERT(!Core::WantsDeterminism());

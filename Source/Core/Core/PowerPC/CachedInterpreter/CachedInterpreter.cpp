@@ -15,6 +15,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/Debugger/DivergenceTracer.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HW/CPU.h"
 #include "Core/Host.h"
@@ -62,6 +63,7 @@ void CachedInterpreter::ExecuteOneBlock()
   }
 
   auto& ppc_state = m_ppc_state;
+
   while (true)
   {
     const auto callback = *reinterpret_cast<const AnyCallback*>(normal_entry);
@@ -85,6 +87,9 @@ void CachedInterpreter::ExecuteOneBlock()
         break;
     }
   }
+
+  if (DivergenceTracer::IsBlockTracingEnabled())
+    DivergenceTracer::LogBlock(m_ppc_state.pc, m_ppc_state);
 }
 
 void CachedInterpreter::Run()

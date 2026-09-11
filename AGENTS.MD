@@ -136,3 +136,46 @@ Because 32-register 3-operand permutation tables would exceed gigabytes, stencil
   ```
   Or crop targeted bounding boxes (e.g., top-left FPS overlay) using Python PIL before reading. Text output costs only ~15 tokens (>98% reduction).
 
+---
+
+## 8. Lockstep Divergence Debugging & Mobile FPS Diagnosis (AGENTS Session Handover)
+
+### 8.1 Confusions Encountered & Concrete Root Causes During 1,000,000 Step Parity
+
+During lockstep parity verification between `StencilInterpreter` (Core 6) and `CachedInterpreter` (Core 5) using `divergence_detector.py`:
+
+1. **Confusion 1: Divergence at Step 82 with Block Linking Enabled**
+   - **Symptom:** As soon as `JITNoBlockLinking = False`, execution diverged at block 82 with completely different PCs and GPRs.
+   - **Root Cause:** `DivergenceTracer::LogBlock` was originally placed *outside* the `while(true)` dispatch loop in `ExecuteOneBlock()`. When `ExecuteBlockLinkBranch` chained to the next block, it executed multiple blocks in a single C++ call before returning, skipping intermediate basic block trace logs and comparing Block 1 in JIT against Block 15 in Interpreter.
+   - **Solution:** Moved `LogBlock` directly to block exits: `ExecuteBlockLinkDirect`, `ExecuteBlockLinkBranch`, and `EndBlock`.
+
+2. **Confusion 2: Divergence at Step 16,335 in OSGetTime**
+   - **Symptom:** Execution diverged at `0x803426fc` with `r4` (Time Base Lower) mismatching.
+   - **Root Cause:** An experimental 2-block ping-pong idle loop detector (`tl_ping_pong_count >= 16`) inside `ExecuteBlockLinkBranch` was calling `GetCoreTiming().Idle()` after 16 iterations of any 2-block branch, advancing the cycle counter prematurely. Right after, `OSGetTime()` ran `mftbu r4`, reading a skewed Time Base.
+   - **Solution:** Removed the artificial 16-iteration threshold from `ExecuteBlockLinkBranch`.
+
+3. **Confusion 3: Intermittent Parity Failure at Step 16,337 by Exactly 40,500,000 Cycles (1.0 Second)**
+   - **Symptom:** In some test runs, `r5` and `r29` diverged at step 16,337 by exactly `0x269fb20` (40,500,000 cycles = 1.0 second), while in other runs it passed 100,000+ steps with 0 divergence.
+   - **Root Cause:** `CEXIIPL::GetEmulatedTime()` in `EXI_DeviceIPL.cpp`, `EXI.cpp`, and `GCMemcardRaw.cpp` queried the host OS real-time clock via `Common::Timer::GetLocalTimeSinceJan1970()` without honoring `MAIN_CUSTOM_RTC_ENABLE` / `MAIN_CUSTOM_RTC_VALUE`. When Instance A and Instance B were spawned across a 1-second host clock boundary, one instance started with a 1-second offset.
+   - **Solution:** Updated `CEXIIPL::GetEmulatedTime()`, `EXI.cpp`, and `GCMemcardRaw.cpp` so that when `MAIN_CUSTOM_RTC_ENABLE` is active, emulated time strictly starts from `CustomRTCValue` and advances purely deterministically based on emulated CPU ticks (`ticks / ticks_per_sec`).
+
+4. **Confusion 4: Divergence at Step 693,545 (`PC=0x00000888` vs `PC=0x00000800`)**
+   - **Symptom:** At step 693,544, block `0x802aecbc` executed `lfs` with `MSR.FP == 0`, raising an FP Unavailable exception. CachedInterpreter logged `0x00000800`, while StencilInterpreter logged `0x00000888`.
+   - **Root Cause:** In `CachedInterpreter`, when `CheckFPU` returns 0, the dispatch loop breaks and `LogBlock` logs the exception exit PC (`0x00000800`). In `StencilInterpreter`, `CheckFPU` returned 0 without calling `LogBlock`, so the exception block's exit was never logged, causing the trace streams to shift by 1 block.
+   - **Solution:** Added `DivergenceTracer::LogBlock` inside `CheckFPU`, `CheckBreakpoint`, and `InterpretAndCheckExceptions` when an exception alters PC and aborts the block.
+   - **Result:** **1,000,000 basic blocks reached with ZERO divergence.**
+
+---
+
+### 8.2 Why the Phone Gets 30 FPS on Safety Screen and 2.8 FPS on Title Screen
+
+1. **Safety Screen (30 FPS):**
+   - The Wii safety/wrist-strap screen is a simple 2D static scene with minimal CPU load and low vertex counts. The PowerPC CPU easily completes all frame logic within the allocated slice and syncs to VSync (30 FPS cap).
+2. **Title Screen (2.8 FPS) & The 2-Block Idle Polling Bottleneck:**
+   - On the 3D title screen, *Sin & Punishment* enters a tight 2-block polling loop (`0x800380F4` <-> `0x80038114`) waiting for Wiimote input and VBlank timers.
+   - When we had the 2-block ping-pong detector calling `CoreTiming::Idle()`, the CPU yielded immediately upon detecting the wait loop, and the title screen reached **8.76 FPS (27.4 VPS)**.
+   - In order to pass the 1,000,000 step lockstep test against CachedInterpreter (which has no multi-block idle detector), we disabled that ping-pong idle skip.
+   - Without idle skipping, the CPU executes all **6,300,000+ basic blocks per second** (`[StencilBench] Speed: 34.0% | MIPS: 248.2 | Blocks/s: 6.3M`) in that tight polling loop, completely starving the frame budget and dragging title screen rendering down to 2.8 FPS.
+3. **Path Forward to Recover 8.8+ FPS on Mobile:**
+   - Gate the multi-block idle skip on `!Core::WantsDeterminism()` or a configuration setting (e.g. `SyncOnSkipIdle` / `JITIdleLoopOptimization`), so divergence testing runs 100% deterministic lockstep, while real gameplay on device uses idle skipping to fast-forward polling loops to 8.8+ FPS.
+

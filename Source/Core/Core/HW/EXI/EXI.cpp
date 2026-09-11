@@ -130,7 +130,10 @@ void ExpansionInterfaceManager::Init(const Sram* override_sram)
     const u32 rtc_bias = sram.settings.rtc_bias;
     const u32 sram_language = static_cast<u32>(sram.settings.language);
     const u64 format_time =
-        Common::Timer::GetLocalTimeSinceJan1970() - ExpansionInterface::CEXIIPL::GC_EPOCH;
+        (Config::Get(Config::MAIN_CUSTOM_RTC_ENABLE) ?
+             Config::Get(Config::MAIN_CUSTOM_RTC_VALUE) :
+             Common::Timer::GetLocalTimeSinceJan1970()) -
+        ExpansionInterface::CEXIIPL::GC_EPOCH;
 
     for (u32 i = 0; i < MAX_EXI_CHANNELS; i++)
     {

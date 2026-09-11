@@ -47,9 +47,13 @@ void stencil_dyn_cmpwi();
 void stencil_dyn_cmpl();
 void stencil_dyn_cmp();
 void stencil_tape_jump();
+void a642a64_stencil_exit_nodec();
+void stencil_tape_direct_jump();
+void stencil_tape_cond_branch();
 }
 #else
 inline void a642a64_stencil_exit() {}
+inline void a642a64_stencil_exit_nodec() {}
 inline uint32_t a642a64_run_stencil(const void*, void*, void*, void*, int*) { return 0; }
 inline void stencil_dyn_addi() {}
 inline void stencil_dyn_addis() {}
@@ -86,4 +90,6 @@ inline void stencil_dyn_cmpwi() {}
 inline void stencil_dyn_cmpl() {}
 inline void stencil_dyn_cmp() {}
 inline void stencil_tape_jump() {}
+inline void stencil_tape_direct_jump() {}
+inline void stencil_tape_cond_branch() {}
 #endif

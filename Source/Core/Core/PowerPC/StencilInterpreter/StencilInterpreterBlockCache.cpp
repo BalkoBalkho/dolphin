@@ -30,15 +30,39 @@ void StencilInterpreterBlockCache::ClearRangesToFree()
 }
 
 #include <cstring>
+#include "Core/PowerPC/CachedInterpreter/CachedInterpreterEmitter.h"
+#include "Core/PowerPC/StencilInterpreter/StencilInterpreter.h"
 
 void StencilInterpreterBlockCache::WriteLinkBlock(const JitBlock::LinkData& source,
                                                   const JitBlock* dest)
 {
-  if (source.exitPtrs)
+  if (!source.exitPtrs)
+    return;
+
+#ifdef _M_ARM_64
+  if (source.exitFarcode != nullptr)
   {
-    const u8* target = dest ? dest->normalEntry : nullptr;
-    std::memcpy(source.exitPtrs, &target, sizeof(target));
+    // Native Tape Link: resolve target first_stencil and tape cursor
+    StencilInterpreter::TapeTargetLink link{nullptr, nullptr};
+    if (dest && dest->normalEntry)
+    {
+      const auto cb = *reinterpret_cast<const CachedInterpreterEmitter::AnyCallback*>(dest->normalEntry);
+      if (cb == CachedInterpreterEmitter::AnyCallbackCast(StencilInterpreter::ExecuteTapeRun<true>) ||
+          cb == CachedInterpreterEmitter::AnyCallbackCast(StencilInterpreter::ExecuteTapeRun<false>))
+      {
+        const auto* header = reinterpret_cast<const StencilInterpreter::TapeRunOperands*>(
+            dest->normalEntry + sizeof(CachedInterpreterEmitter::AnyCallback));
+        link.first_stencil = header->first_stencil;
+        link.tape_cursor = dest->normalEntry + sizeof(CachedInterpreterEmitter::AnyCallback) + sizeof(StencilInterpreter::TapeRunOperands);
+      }
+    }
+    std::memcpy(source.exitPtrs, &link, sizeof(link));
+    return;
   }
+#endif
+
+  const u8* target = dest ? dest->normalEntry : nullptr;
+  std::memcpy(source.exitPtrs, &target, sizeof(target));
 }
 
 void StencilInterpreterBlockCache::WriteDestroyBlock(const JitBlock& block)

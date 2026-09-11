@@ -56,6 +56,8 @@ namespace Config
 extern const Info<bool> MAIN_SKIP_IPL;
 extern const Info<PowerPC::CPUCore> MAIN_CPU_CORE;
 extern const Info<bool> MAIN_JIT_FOLLOW_BRANCH;
+extern const Info<bool> MAIN_JIT_NO_BLOCK_LINKING;
+extern const Info<bool> MAIN_JIT_NO_BLOCK_CACHE;
 extern const Info<bool> MAIN_FASTMEM;
 extern const Info<bool> MAIN_PAGE_TABLE_FASTMEM;
 extern const Info<bool> MAIN_FASTMEM_ARENA;

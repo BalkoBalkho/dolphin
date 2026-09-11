@@ -10,6 +10,20 @@
 //     int* downcount_ptr         // x4: in/out downcount pointer
 // );
 
+.global a642a64_stencil_exit_nodec
+a642a64_stencil_exit_nodec:
+    // Sync downcount in w26 back to memory
+    ldr  x4, [sp, #56]
+    cbz  x4, 1f
+    str  w26, [x4]
+1:
+    // Restore callee-saved registers
+    ldp  x19, x20, [sp, #16]
+    ldp  x27, x28, [sp, #32]
+    ldr  x26,      [sp, #48]
+    ldp  x29, x30, [sp], #80
+    ret
+
 .global a642a64_stencil_exit
 a642a64_stencil_exit:
     // 1. Calculate instructions executed from tape cursor advance: (x20 - tape_base) / 16
@@ -17,18 +31,9 @@ a642a64_stencil_exit:
     sub  x0, x20, x1
     lsr  w0, w0, #4
 
-    // 2. Decrement downcount in w26 and sync back to memory
-    ldr  x4, [sp, #56]
-    cbz  x4, 1f
+    // 2. Decrement downcount in w26
     sub  w26, w26, w0
-    str  w26, [x4]
-1:
-    // 3. Restore callee-saved registers
-    ldp  x19, x20, [sp, #16]
-    ldp  x27, x28, [sp, #32]
-    ldr  x26,      [sp, #48]
-    ldp  x29, x30, [sp], #80
-    ret
+    b    a642a64_stencil_exit_nodec
 
 .global a642a64_run_stencil
 .type a642a64_run_stencil, %function
@@ -392,9 +397,19 @@ stencil_dyn_stw:
     cbz   w2, 1f
     READ_GPR w4, w2
     add   w0, w4, w0
-1:  READ_GPR w5, w3
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    READ_GPR w5, w3
     rev   w5, w5
     str   w5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    READ_GPR w2, w3
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU32
+    ldp   x3, x30, [sp], #16
     STENCIL_TAILCALL
 
 .global stencil_dyn_lbz
@@ -429,8 +444,18 @@ stencil_dyn_stb:
     cbz   w2, 1f
     READ_GPR w4, w2
     add   w0, w4, w0
-1:  READ_GPR w5, w3
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    READ_GPR w5, w3
     strb  w5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    READ_GPR w2, w3
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU8
+    ldp   x3, x30, [sp], #16
     STENCIL_TAILCALL
 
 .global stencil_dyn_lhz
@@ -466,9 +491,19 @@ stencil_dyn_sth:
     cbz   w2, 1f
     READ_GPR w4, w2
     add   w0, w4, w0
-1:  READ_GPR w5, w3
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    READ_GPR w5, w3
     rev16 w5, w5
     strh  w5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    READ_GPR w2, w3
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU16
+    ldp   x3, x30, [sp], #16
     STENCIL_TAILCALL
 
 // -------------------------------------------------------------
@@ -608,5 +643,142 @@ stencil_tape_jump:
     ldr   x20, [x20, #8]
     ldr   x16, [x20]
     br    x16
+
+// -------------------------------------------------------------
+// Native Tape Inter-Block Linking Stencils
+// -------------------------------------------------------------
+
+// TapeDirectLinkData:
+// offset 0:  target.first_stencil (ptr)
+// offset 8:  target.tape_cursor (ptr)
+// offset 16: destination_pc (u32)
+// offset 20: downcount_cycles (u32)
+
+.global stencil_tape_direct_jump
+stencil_tape_direct_jump:
+    ldr   x1, [x20, #8]            // x1 = pointer to TapeDirectLinkData
+    ldr   w2, [x1, #20]            // w2 = downcount_cycles
+    subs  w26, w26, w2             // decrement register downcount
+    b.le  10f                      // timeslice expired -> return to C++
+
+    ldr   w3, [x1, #16]            // destination_pc
+    str   w3, [x19, #0]            // ppc_state.pc = destination_pc
+    str   w3, [x19, #4]            // ppc_state.npc = destination_pc
+
+    ldr   x20, [x1, #8]            // x20 = target.tape_cursor
+    cbz   x20, 20f                 // unlinked -> return to C++ to compile
+
+    ldr   x16, [x1, #0]            // x16 = target.first_stencil
+    br    x16                      // Jump directly into target block!
+
+10: // Timeslice expired (w26 <= 0)
+    ldr   w3, [x1, #16]            // destination_pc
+    str   w3, [x19, #0]            // ppc_state.pc = destination_pc
+    str   w3, [x19, #4]            // ppc_state.npc = destination_pc
+20: // Unlinked or timeslice exit
+    b     a642a64_stencil_exit_nodec
+
+
+// TapeCondBranchLinkData:
+// offset 0:  taken.first_stencil (ptr)
+// offset 8:  taken.tape_cursor (ptr)
+// offset 16: taken_destination_pc (u32)
+// offset 20: downcount_cycles (u32)
+// offset 24: fallthrough.first_stencil (ptr)
+// offset 32: fallthrough.tape_cursor (ptr)
+// offset 40: fallthrough_destination_pc (u32)
+// offset 44: pad (u32)
+// offset 48: bo (u32)
+// offset 52: bi (u32)
+
+.global stencil_tape_cond_branch
+stencil_tape_cond_branch:
+    ldr   x1, [x20, #8]            // x1 = pointer to TapeCondBranchLinkData
+    ldr   w2, [x1, #20]            // w2 = downcount_cycles
+    subs  w26, w26, w2             // decrement register downcount
+
+    // Load BO and BI
+    ldr   w10, [x1, #48]           // w10 = BO
+    ldr   w11, [x1, #52]           // w11 = BI
+
+    // 1. Counter check: BO & BO_DONT_DECREMENT_FLAG (4)
+    tbz   w10, #2, 100f            // if (BO & 4) == 0, check counter
+    mov   w12, #1                  // counter = true
+    b     101f
+100:
+    // Decrement CTR (spr[SPR_CTR] at offset 868)
+    ldr   w14, [x19, #868]
+    sub   w14, w14, #1
+    str   w14, [x19, #868]
+    cmp   w14, #0
+    cset  w15, ne
+    ubfx  w16, w10, #1, #1
+    eor   w12, w15, w16            // w12 = counter
+101:
+    // 2. Condition check: BO & BO_DONT_CHECK_CONDITION (16)
+    tbnz  w10, #4, 102f            // if (BO & 16) != 0, ignore condition (true)
+
+    // BI: cr_field = BI >> 2, cr_sub = BI & 3
+    ubfx  w13, w11, #2, #3         // cr_field (0..7)
+    add   x14, x19, #672           // cr.fields base
+    ldr   x15, [x14, w13, uxtw #3] // 64-bit cr_val
+    and   w16, w11, #3             // cr_sub (0: LT, 1: GT, 2: EQ, 3: SO)
+
+    cmp   w16, #2
+    b.eq  200f                     // EQ
+    cmp   w16, #0
+    b.eq  201f                     // LT
+    cmp   w16, #1
+    b.eq  202f                     // GT
+    // SO: bit 59
+    lsr   x15, x15, #59
+    and   w14, w15, #1
+    b     203f
+200: // EQ: lower 32 bits == 0
+    cmp   w15, #0
+    cset  w14, eq
+    b     203f
+201: // LT: bit 62
+    lsr   x15, x15, #62
+    and   w14, w15, #1
+    b     203f
+202: // GT: (s64)cr_val > 0
+    cmp   x15, #0
+    cset  w14, gt
+203:
+    // true_false = (BO >> 3) & 1
+    ubfx  w16, w10, #3, #1
+    cmp   w14, w16
+    cset  w13, eq                  // w13 = condition
+    b     103f
+102:
+    mov   w13, #1                  // condition = true
+103:
+    // taken = counter && condition
+    and   w12, w12, w13
+
+    // Select target: if taken (w12 != 0), x1 stays at x1; if fallthrough (w12 == 0), x1 += 24
+    cbnz  w12, 105f
+    add   x1, x1, #24
+105:
+    cmp   w26, #0
+    b.le  10f
+
+    ldr   w3, [x1, #16]            // destination_pc
+    str   w3, [x19, #0]            // ppc_state.pc = destination_pc
+    str   w3, [x19, #4]            // ppc_state.npc = destination_pc
+
+    ldr   x20, [x1, #8]            // x20 = target.tape_cursor
+    cbz   x20, 20f                 // unlinked -> return to C++ to compile
+
+    ldr   x16, [x1, #0]            // x16 = target.first_stencil
+    br    x16                      // Jump directly into target block!
+
+10: // Timeslice expired
+    ldr   w3, [x1, #16]            // destination_pc
+    str   w3, [x19, #0]            // ppc_state.pc = destination_pc
+    str   w3, [x19, #4]            // ppc_state.npc = destination_pc
+20:
+    b     a642a64_stencil_exit_nodec
 
 #endif

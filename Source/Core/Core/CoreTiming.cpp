@@ -21,6 +21,7 @@
 #include "Core/CPUThreadConfigCallback.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/Debugger/DivergenceTracer.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -355,6 +356,10 @@ void CoreTimingManager::Advance()
 
   int cyclesExecuted = m_globals.slice_length - DowncountToCycles(ppc_state.downcount);
   m_globals.global_timer += cyclesExecuted;
+
+  if (DivergenceTracer::IsEnabled())
+    DivergenceTracer::LogSlice(m_globals.global_timer, ppc_state);
+
   m_last_oc_factor = m_config_oc_factor;
   m_globals.last_OC_factor_inverted = m_config_oc_inv_factor;
   m_globals.slice_length = MAX_SLICE_LENGTH;

@@ -68,6 +68,8 @@ add_library(core
   Debugger/DebugInterface.h
   Debugger/Debugger_SymbolMap.cpp
   Debugger/Debugger_SymbolMap.h
+  Debugger/DivergenceTracer.cpp
+  Debugger/DivergenceTracer.h
   Debugger/Dump.cpp
   Debugger/Dump.h
   Debugger/OSThread.cpp

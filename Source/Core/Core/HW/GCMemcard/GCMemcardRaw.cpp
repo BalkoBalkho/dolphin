@@ -22,6 +22,8 @@
 #include "Common/StringUtil.h"
 #include "Common/Thread.h"
 #include "Common/Timer.h"
+#include "Common/Config/Config.h"
+#include "Core/Config/MainSettings.h"
 
 #include "Core/Config/SessionSettings.h"
 #include "Core/ConfigManager.h"
@@ -65,7 +67,10 @@ MemoryCard::MemoryCard(std::string filename, ExpansionInterface::Slot card_slot,
     const u32 rtc_bias = sram.settings.rtc_bias;
     const u32 sram_language = static_cast<u32>(sram.settings.language);
     const u64 format_time =
-        Common::Timer::GetLocalTimeSinceJan1970() - ExpansionInterface::CEXIIPL::GC_EPOCH;
+        (Config::Get(Config::MAIN_CUSTOM_RTC_ENABLE) ?
+             Config::Get(Config::MAIN_CUSTOM_RTC_VALUE) :
+             Common::Timer::GetLocalTimeSinceJan1970()) -
+        ExpansionInterface::CEXIIPL::GC_EPOCH;
     Memcard::GCMemcard::Format(&m_memcard_data[0], flash_id, size_mbits, shift_jis, rtc_bias,
                                sram_language, format_time);
 

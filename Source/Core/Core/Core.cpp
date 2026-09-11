@@ -43,6 +43,7 @@
 #include "Core/CPUThreadConfigCallback.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
+#include "Core/Debugger/DivergenceTracer.h"
 #include "Core/CoreTiming.h"
 #include "Core/DSPEmulator.h"
 #include "Core/DolphinAnalytics.h"
@@ -382,7 +383,9 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
   }
 
   // Enter CPU run loop. When we leave it - we are done.
+  DivergenceTracer::Init();
   system.GetCPU().Run();
+  DivergenceTracer::Shutdown();
 
 #ifdef USE_MEMORYWATCHER
   s_memory_watcher.reset();
