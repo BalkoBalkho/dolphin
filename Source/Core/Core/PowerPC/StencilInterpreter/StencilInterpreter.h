@@ -134,9 +134,119 @@ private:
     bool canEndBlock;
   };
 
+  enum class StencilOpType : u8
+  {
+    None = 0,
+    Addi,
+    Addis,
+    Ori,
+    Oris,
+    Xori,
+    Xoris,
+    Rlwinm,
+    Cmplwi,
+    Cmpwi,
+    Cmp,
+    Cmpl,
+    Add,
+    Subf,
+    Mr,
+    Or,
+    And,
+    Xor,
+    Nor,
+    Slw,
+    Srw,
+    Neg,
+    Extsb,
+    Extsh,
+    Cntlzw,
+    Lbz,
+    Lhz,
+    Lwz,
+    Stw,
+    Stb,
+    Sth,
+    Stwu,
+    Mflr,
+    Mtlr,
+    Blr,
+    Mulli,
+    Mullw,
+    Lwzx,
+    Stwx,
+    Sraw,
+    Srawi,
+    Lfs,
+    Stfs,
+    Lfd,
+    Stfd,
+    Fmr,
+    Rlwimi,
+    Lbzu,
+    Mtctr,
+    Mfctr,
+    Mfmsr,
+    Dcbi,
+    // Paired Single SIMD (OP4)
+    PsAdd,
+    PsSub,
+    PsMul,
+    PsDiv,
+    PsMadd,
+    PsMsub,
+    PsNeg,
+    PsAbs,
+    PsNabs,
+    PsMerge00,
+    PsMerge01,
+    PsMerge10,
+    PsMerge11,
+    // Single Precision FP (OP59)
+    Fadds,
+    Fsubs,
+    Fmuls,
+    Fdivs,
+    Fmadds,
+    Fmsubs,
+    // Double Precision FP (OP63)
+    Fadd,
+    Fsub,
+    Fmul,
+    Fdiv,
+    Fmadd,
+    Fmsub,
+    Fabs,
+    Fneg,
+    Fnabs,
+    Fsel,
+    // Integer OP31
+    Andc,
+    Orc,
+    Nand,
+    Eqv,
+    Divw,
+    Divwu,
+    Mulhw,
+    Mulhwu,
+  };
+
+  struct DecodedStencilOp
+  {
+    StencilOpType type = StencilOpType::None;
+    const u8* stencil_fn = nullptr;
+    uint64_t packed_operand = 0;
+    u8 rd = 0;
+    u8 ra = 0;
+    u8 rb = 0;
+    u32 imm = 0;
+  };
+
   void EmitTapeRun(const std::vector<StencilTapeItem>& run, u32 pc);
   bool TryEmitTapeBranch(const PPCAnalyst::CodeOp& op, JitBlock* b, std::vector<StencilTapeItem>& tape_run);
+  std::optional<DecodedStencilOp> DecodeStencilOp(const PPCAnalyst::CodeOp& op);
   std::optional<StencilTapeItem> TryEmitStencil(const PPCAnalyst::CodeOp& op);
+  std::optional<StencilTapeItem> TryEmitSuperStencil(const PPCAnalyst::CodeOp& op1, const PPCAnalyst::CodeOp& op2);
   bool TryWriteBlockEnd(const PPCAnalyst::CodeOp& op, JitBlock* b);
 
   static s32 StartProfiledBlock(PowerPC::PowerPCState& ppc_state,
@@ -266,6 +376,7 @@ struct StencilInterpreter::BlockLinkDirectOperands
   u32 downcount_amount;
   u32 num_load_stores;
   u32 num_fp_inst;
+  u32 return_address;
 };
 
 struct StencilInterpreter::BlockLinkBranchOperands

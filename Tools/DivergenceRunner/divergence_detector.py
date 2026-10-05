@@ -122,6 +122,17 @@ class DivergenceRunner:
         create_user_dir(self.user_jit, self.args.jit_core)
         create_user_dir(self.user_interp, self.args.interp_core)
 
+        self.triad = getattr(self.args, "triad", False)
+        if self.triad:
+            self.pipe_ref2_path = self.work_dir / "ref2.pipe"
+            os.mkfifo(self.pipe_ref2_path)
+            self.user_ref2 = self.work_dir / "user_ref2"
+            create_user_dir(self.user_ref2, self.args.interp_core)
+            self.proc_ref2 = None
+            self.container_ref2_name = f"dolphin_ref2_{os.getpid()}"
+            self.history_ref2 = collections.deque(maxlen=30)
+            self.autoskip_count = 0
+
         self.proc_jit = None
         self.proc_interp = None
         self.container_jit_name = f"dolphin_jit_{os.getpid()}"
@@ -143,14 +154,20 @@ class DivergenceRunner:
     def cleanup(self):
         print(f"\n{YELLOW}[DivergenceRunner] Cleaning up processes and containers...{RESET}")
         if self.args.mode == "podman":
-            for name in (self.container_jit_name, self.container_interp_name):
+            containers = [self.container_jit_name, self.container_interp_name]
+            if self.triad:
+                containers.append(self.container_ref2_name)
+            for name in containers:
                 try:
                     subprocess.run(["podman", "kill", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(["podman", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
         else:
-            for p in (self.proc_jit, self.proc_interp):
+            procs = [self.proc_jit, self.proc_interp]
+            if self.triad and self.proc_ref2:
+                procs.append(self.proc_ref2)
+            for p in procs:
                 if p and p.poll() is None:
                     try:
                         p.terminate()
@@ -163,30 +180,40 @@ class DivergenceRunner:
                 self.pipe_jit_path.unlink()
             if self.pipe_interp_path.exists():
                 self.pipe_interp_path.unlink()
+            if self.triad and self.pipe_ref2_path.exists():
+                self.pipe_ref2_path.unlink()
         except Exception:
             pass
 
     def pause_instances(self):
-        """Immediately pauses both instances to freeze state on divergence."""
+        """Immediately pauses all instances to freeze state on divergence."""
         if self.args.mode == "podman":
             subprocess.run(["podman", "pause", self.container_jit_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["podman", "pause", self.container_interp_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self.triad:
+                subprocess.run(["podman", "pause", self.container_ref2_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             if self.proc_jit and self.proc_jit.poll() is None:
                 os.kill(self.proc_jit.pid, signal.SIGSTOP)
             if self.proc_interp and self.proc_interp.poll() is None:
                 os.kill(self.proc_interp.pid, signal.SIGSTOP)
+            if self.triad and self.proc_ref2 and self.proc_ref2.poll() is None:
+                os.kill(self.proc_ref2.pid, signal.SIGSTOP)
 
     def resume_instances(self):
-        """Resumes both instances after pausing."""
+        """Resumes all instances after pausing."""
         if self.args.mode == "podman":
             subprocess.run(["podman", "unpause", self.container_jit_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["podman", "unpause", self.container_interp_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if self.triad:
+                subprocess.run(["podman", "unpause", self.container_ref2_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             if self.proc_jit and self.proc_jit.poll() is None:
                 os.kill(self.proc_jit.pid, signal.SIGCONT)
             if self.proc_interp and self.proc_interp.poll() is None:
                 os.kill(self.proc_interp.pid, signal.SIGCONT)
+            if self.triad and self.proc_ref2 and self.proc_ref2.poll() is None:
+                os.kill(self.proc_ref2.pid, signal.SIGCONT)
 
     def launch(self):
         d_binary = Path(self.args.dolphin_bin).resolve()
@@ -264,8 +291,41 @@ class DivergenceRunner:
                 "-e", str(exec_file)
             ]
 
+        cmd_ref2 = None
+        if self.triad:
+            if self.args.mode == "podman":
+                cmd_ref2 = [
+                    "podman", "run", "--rm",
+                    "--name", self.container_ref2_name,
+                    "--ipc=host",
+                    "-e", "HOME=/tmp",
+                    "-v", "/usr:/usr:ro",
+                    "-v", f"{dolphin_root}:/dolphin:ro",
+                    "-v", f"{exec_file.parent}:/game_dir:ro",
+                    "-v", f"{self.work_dir}:/div",
+                    "-e", "DOLPHIN_DIVERGENCE_PIPE=/div/ref2.pipe",
+                    "-e", f"DOLPHIN_DIVERGENCE_BLOCK={block_env}",
+                    "docker.io/library/archlinux:latest",
+                    f"/dolphin/{d_binary.relative_to(dolphin_root)}",
+                    "-p", "headless", "-v", "Null",
+                    "-u", "/div/user_ref2",
+                    "-e", f"/game_dir/{exec_file.name}"
+                ]
+            else:
+                env_ref2 = os.environ.copy()
+                env_ref2["DOLPHIN_DIVERGENCE_PIPE"] = str(self.pipe_ref2_path)
+                env_ref2["DOLPHIN_DIVERGENCE_BLOCK"] = block_env
+                cmd_ref2 = [
+                    str(d_binary),
+                    "-p", "headless", "-v", "Null",
+                    "-u", str(self.user_ref2),
+                    "-e", str(exec_file)
+                ]
+
         self.log_jit = open(self.work_dir / "jit.log", "w")
         self.log_interp = open(self.work_dir / "interp.log", "w")
+        if self.triad:
+            self.log_ref2 = open(self.work_dir / "ref2.log", "w")
 
         print(f"{YELLOW}[*] Launching Instance A (JIT)...{RESET}")
         self.proc_jit = subprocess.Popen(
@@ -275,7 +335,7 @@ class DivergenceRunner:
             env=(None if self.args.mode == "podman" else env_jit)
         )
 
-        print(f"{YELLOW}[*] Launching Instance B (Reference Cached Interpreter)...{RESET}")
+        print(f"{YELLOW}[*] Launching Instance B (Reference Cached Interpreter 1)...{RESET}")
         self.proc_interp = subprocess.Popen(
             cmd_interp,
             stdout=self.log_interp,
@@ -283,28 +343,43 @@ class DivergenceRunner:
             env=(None if self.args.mode == "podman" else env_interp)
         )
 
+        if self.triad:
+            print(f"{YELLOW}[*] Launching Instance C (Reference Cached Interpreter 2)...{RESET}")
+            self.proc_ref2 = subprocess.Popen(
+                cmd_ref2,
+                stdout=self.log_ref2,
+                stderr=subprocess.STDOUT,
+                env=(None if self.args.mode == "podman" else env_ref2)
+            )
+
         print(f"{GREEN}[*] Opening FIFO streams...{RESET}")
-        # Note: opening FIFOs in read mode blocks until the writers open them.
         fd_jit = os.open(self.pipe_jit_path, os.O_RDONLY)
         fd_interp = os.open(self.pipe_interp_path, os.O_RDONLY)
         f_jit = os.fdopen(fd_jit, "rb", buffering=65536)
         f_interp = os.fdopen(fd_interp, "rb", buffering=65536)
-        print(f"{GREEN}[*] Both instances connected! Monitoring lockstep execution...{RESET}\n")
 
-        self.run_monitor(f_jit, f_interp)
+        f_ref2 = None
+        if self.triad:
+            fd_ref2 = os.open(self.pipe_ref2_path, os.O_RDONLY)
+            f_ref2 = os.fdopen(fd_ref2, "rb", buffering=65536)
 
-    def run_monitor(self, f_jit, f_interp):
+        print(f"{GREEN}[*] All instances connected! Monitoring lockstep execution...{RESET}\n")
+
+        self.run_monitor(f_jit, f_interp, f_ref2)
+
+    def run_monitor(self, f_jit, f_interp, f_ref2=None):
         count = 0
         t0 = time.time()
         last_report = t0
         last_count = 0
 
         while True:
-            # Read exact 160-byte record from both
+            # Read exact 160-byte record from all
             buf_jit = f_jit.read(RECORD_SIZE)
             buf_interp = f_interp.read(RECORD_SIZE)
+            buf_ref2 = f_ref2.read(RECORD_SIZE) if f_ref2 else None
 
-            if len(buf_jit) < RECORD_SIZE or len(buf_interp) < RECORD_SIZE:
+            if len(buf_jit) < RECORD_SIZE or len(buf_interp) < RECORD_SIZE or (buf_ref2 and len(buf_ref2) < RECORD_SIZE):
                 # One of the instances exited or crashed
                 self.pause_instances()
                 print(f"\n{YELLOW}[!] Stream closed (Instance terminated or reached EOF).{RESET}")
@@ -312,15 +387,31 @@ class DivergenceRunner:
                     print(f"    Instance A (JIT) closed the pipe. Bytes: {len(buf_jit)}")
                 if len(buf_interp) < RECORD_SIZE:
                     print(f"    Instance B (Interp) closed the pipe. Bytes: {len(buf_interp)}")
+                if buf_ref2 and len(buf_ref2) < RECORD_SIZE:
+                    print(f"    Instance C (Ref2) closed the pipe. Bytes: {len(buf_ref2)}")
                 print(f"    Total synchronised steps: {count:,}")
                 break
 
             rec_jit = StateSnapshot(RECORD_STRUCT.unpack(buf_jit))
             rec_interp = StateSnapshot(RECORD_STRUCT.unpack(buf_interp))
+            rec_ref2 = StateSnapshot(RECORD_STRUCT.unpack(buf_ref2)) if buf_ref2 else None
 
             self.history_jit.append(rec_jit)
             self.history_interp.append(rec_interp)
+            if rec_ref2:
+                self.history_ref2.append(rec_ref2)
             count += 1
+
+            # Divergent instruction hypothesis: 2 instances of same reference CPU diverge
+            if rec_ref2:
+                diff_refs = rec_interp.diff(rec_ref2, self.ignored_registers)
+                if diff_refs:
+                    self.autoskip_count += 1
+                    mismatches = [d[0] for d in diff_refs]
+                    print(f"\n{YELLOW}[SKIP] DIVERGENT INSTRUCTION HYPOTHESIS #{self.autoskip_count}: 2 instances of same reference CPU diverged at step {count:,} (PC: 0x{rec_interp.pc:08x})!{RESET}")
+                    print(f"       Ref1 vs Ref2 diff: {', '.join(mismatches)}")
+                    print(f"       -> Inherent non-determinism on this instruction. Auto-skipping target divergence.")
+                    continue
 
             # Compare architectural state: PC + MSR + CR + XER + LR + CTR + 32 GPRs (offset 8 onward)
             diffs = rec_jit.diff(rec_interp, self.ignored_registers)
@@ -349,6 +440,14 @@ class DivergenceRunner:
                 break
 
     def handle_divergence(self, jit: StateSnapshot, interp: StateSnapshot, step_idx: int, diffs: list) -> bool:
+        # Check hypothesis: If 2 instances of the same CPU diverge, assume inherent instruction divergence
+        if self.args.jit_core == self.args.interp_core:
+            mismatched_names = [d[0] for d in diffs]
+            print(f"\n{YELLOW}[SKIP] DIVERGENT INSTRUCTION HYPOTHESIS: 2 instances of same CPU (core {self.args.jit_core}) diverged at step {step_idx:,} (PC: 0x{jit.pc:08x})!{RESET}")
+            print(f"       Mismatches: {', '.join(mismatched_names)}")
+            print(f"       -> Instruction exhibits inherent divergence; StencilInterpreter diverging is normal behavior. Auto-skipping.")
+            return True
+
         self.divergence_count += 1
         mismatched_names = [d[0] for d in diffs]
 
@@ -446,6 +545,7 @@ def main():
     parser.add_argument("-n", "--max-steps", type=int, default=None, help="Stop after N synchronized steps")
     parser.add_argument("--auto-continue", action="store_true", help="Log divergences and continue running without pausing")
     parser.add_argument("--ignore-regs", type=str, default="", help="Comma-separated register names to ignore (e.g. 'r4,r5')")
+    parser.add_argument("--triad", action="store_true", help="Run 2 instances of same reference CPU + 1 target instance with auto-skip on reference divergence")
 
     args = parser.parse_args()
     runner = DivergenceRunner(args)

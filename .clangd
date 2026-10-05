@@ -1,0 +1,2 @@
+CompileFlags:
+  CompilationDatabase: "Source/Android/app/.cxx/tools/debug/arm64-v8a/"  # Path to the directory containing compile_commands.json

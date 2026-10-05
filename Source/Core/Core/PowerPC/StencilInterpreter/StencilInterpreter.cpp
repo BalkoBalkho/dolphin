@@ -61,6 +61,8 @@ static_assert(offsetof(PowerPC::PowerPCState, gpr) == 32, "GPR offset must be 32
 static_assert(offsetof(PowerPC::PowerPCState, cr.fields) == 672, "CR offset must be 672 for stencil_trampoline.S");
 static_assert(offsetof(PowerPC::PowerPCState, xer_so_ov) == 757, "xer_so_ov offset must be 757 for stencil_trampoline.S");
 static_assert(offsetof(PowerPC::PowerPCState, spr[SPR_CTR]) == 868, "CTR offset must be 868 for stencil_trampoline.S");
+static_assert(offsetof(PowerPC::PowerPCState, ps) == 160, "PS offset must be 160 for stencil_trampoline.S");
+static_assert(offsetof(PowerPC::PowerPCState, msr) == 736, "MSR offset must be 736 for stencil_trampoline.S");
 #pragma GCC diagnostic pop
 #endif
 }  // namespace
@@ -84,6 +86,11 @@ uint32_t Stencil_SlowReadU32(PowerPC::PowerPCState* ppc_state, uint32_t addr)
   return s_system_instance ? s_system_instance->GetMMU().Read<u32>(addr) : 0;
 }
 
+uint64_t Stencil_SlowReadU64(PowerPC::PowerPCState* ppc_state, uint32_t addr)
+{
+  return s_system_instance ? s_system_instance->GetMMU().Read<u64>(addr) : 0;
+}
+
 void Stencil_SlowWriteU8(PowerPC::PowerPCState* ppc_state, uint32_t addr, uint32_t val)
 {
   if (s_system_instance)
@@ -100,6 +107,12 @@ void Stencil_SlowWriteU32(PowerPC::PowerPCState* ppc_state, uint32_t addr, uint3
 {
   if (s_system_instance)
     s_system_instance->GetMMU().Write<u32>(val, addr);
+}
+
+void Stencil_SlowWriteU64(PowerPC::PowerPCState* ppc_state, uint32_t addr, uint64_t val)
+{
+  if (s_system_instance)
+    s_system_instance->GetMMU().Write<u64>(val, addr);
 }
 }
 #endif
@@ -624,6 +637,10 @@ s32 StencilInterpreter::EndBlock(PowerPC::PowerPCState& ppc_state,
   return 0;
 }
 
+static std::array<std::atomic<u64>, 64> s_fallback_counts{};
+static std::array<std::atomic<u64>, 1024> s_subop31_counts{};
+static std::atomic<u64> s_total_fallbacks{0};
+
 template <bool write_pc>
 s32 StencilInterpreter::Interpret(PowerPC::PowerPCState& ppc_state,
                                   const InterpretOperands& operands)
@@ -632,6 +649,44 @@ s32 StencilInterpreter::Interpret(PowerPC::PowerPCState& ppc_state,
   {
     ppc_state.pc = operands.current_pc;
     ppc_state.npc = operands.current_pc + 4;
+  }
+  const u32 opcd = operands.inst.OPCD;
+  s_fallback_counts[opcd]++;
+  if (opcd == 31)
+    s_subop31_counts[operands.inst.SUBOP10]++;
+  const u64 total = ++s_total_fallbacks;
+  if ((total & 0x1FFFFF) == 0) // Every ~2 million fallbacks
+  {
+    std::vector<std::pair<u32, u64>> sorted;
+    for (u32 i = 0; i < 64; ++i)
+    {
+      u64 c = s_fallback_counts[i].load();
+      if (c > 0)
+        sorted.push_back({i, c});
+    }
+    std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string s;
+    for (size_t k = 0; k < std::min<size_t>(5, sorted.size()); ++k)
+    {
+      s += fmt::format("OP{}: {} ({:.1f}%) | ", sorted[k].first, sorted[k].second,
+                       100.0 * sorted[k].second / total);
+    }
+
+    std::vector<std::pair<u32, u64>> sorted31;
+    for (u32 i = 0; i < 1024; ++i)
+    {
+      u64 c = s_subop31_counts[i].load();
+      if (c > 0)
+        sorted31.push_back({i, c});
+    }
+    std::sort(sorted31.begin(), sorted31.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    std::string s31;
+    for (size_t k = 0; k < std::min<size_t>(4, sorted31.size()); ++k)
+    {
+      s31 += fmt::format("SUB{}: {} | ", sorted31[k].first, sorted31[k].second);
+    }
+
+    WARN_LOG_FMT(POWERPC, "[FALLBACK_PROFILE] Total: {} | Top: {} | OP31: {}", total, s, s31);
   }
   operands.func(operands.interpreter, operands.inst);
   return sizeof(AnyCallback) + sizeof(operands);
@@ -916,11 +971,23 @@ bool StencilInterpreter::TryEmitTapeBranch(const PPCAnalyst::CodeOp& op, JitBloc
 #endif
 }
 
-std::optional<StencilInterpreter::StencilTapeItem>
-StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
+std::optional<StencilInterpreter::DecodedStencilOp>
+StencilInterpreter::DecodeStencilOp(const PPCAnalyst::CodeOp& op)
 {
 #if defined(__aarch64__) || defined(_M_ARM64)
   const u32 primary_op = op.inst.OPCD;
+
+  // 0. mulli (primary 7)
+  if (primary_op == 7)
+  {
+    const s16 imm = static_cast<s16>(op.inst.SIMM_16);
+    uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                      (static_cast<uint64_t>(op.inst.RA) << 16) |
+                      static_cast<uint16_t>(imm);
+    return DecodedStencilOp{StencilOpType::Mulli, reinterpret_cast<const u8*>(&stencil_dyn_mulli),
+                            packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                            0, static_cast<u32>(static_cast<s32>(imm))};
+  }
 
   // 1. addi (primary 14)
   if (primary_op == 14)
@@ -929,7 +996,9 @@ StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
     uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                       (static_cast<uint64_t>(op.inst.RA) << 16) |
                       static_cast<uint16_t>(imm);
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_addi), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Addi, reinterpret_cast<const u8*>(&stencil_dyn_addi),
+                            packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                            0, static_cast<u32>(static_cast<s32>(imm))};
   }
 
   // 2. addis (primary 15)
@@ -939,50 +1008,74 @@ StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
     uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                       (static_cast<uint64_t>(op.inst.RA) << 16) |
                       static_cast<uint16_t>(imm);
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_addis), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Addis, reinterpret_cast<const u8*>(&stencil_dyn_addis),
+                            packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                            0, static_cast<u32>(static_cast<s32>(imm))};
   }
 
-  // 3. ori (primary 24): RA = RS | UIMM
+  // 3. ori (primary 24)
   if (primary_op == 24)
   {
     const u16 uimm = op.inst.UIMM;
     uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                       (static_cast<uint64_t>(op.inst.RD) << 16) |
                       uimm;
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_ori), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Ori, reinterpret_cast<const u8*>(&stencil_dyn_ori),
+                            packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                            0, uimm};
   }
 
-  // 4. oris (primary 25): RA = RS | (UIMM << 16)
+  // 4. oris (primary 25)
   if (primary_op == 25)
   {
     const u16 uimm = op.inst.UIMM;
     uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                       (static_cast<uint64_t>(op.inst.RD) << 16) |
                       uimm;
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_oris), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Oris, reinterpret_cast<const u8*>(&stencil_dyn_oris),
+                            packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                            0, uimm};
   }
 
-  // 5. xori (primary 26): RA = RS ^ UIMM
+  // 5. xori (primary 26)
   if (primary_op == 26)
   {
     const u16 uimm = op.inst.UIMM;
     uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                       (static_cast<uint64_t>(op.inst.RD) << 16) |
                       uimm;
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_xori), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Xori, reinterpret_cast<const u8*>(&stencil_dyn_xori),
+                            packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                            0, uimm};
   }
 
-  // 6. xoris (primary 27): RA = RS ^ (UIMM << 16)
+  // 6. xoris (primary 27)
   if (primary_op == 27)
   {
     const u16 uimm = op.inst.UIMM;
     uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                       (static_cast<uint64_t>(op.inst.RD) << 16) |
                       uimm;
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_xoris), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Xoris, reinterpret_cast<const u8*>(&stencil_dyn_xoris),
+                            packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                            0, uimm};
   }
 
-  // 7. rlwinm (primary 21, Rc == 0): RA = Rot(RS, SH) & Mask
+  // 7a. rlwimi (primary 20, Rc == 0)
+  if (primary_op == 20 && op.inst.Rc == 0)
+  {
+    const u32 mask = MakeRotationMask(op.inst.MB, op.inst.ME);
+    const u32 ror_amt = (32 - op.inst.SH) & 31;
+    uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 48) |
+                      (static_cast<uint64_t>(op.inst.RD) << 40) |
+                      (static_cast<uint64_t>(ror_amt) << 32) |
+                      mask;
+    return DecodedStencilOp{StencilOpType::Rlwimi, reinterpret_cast<const u8*>(&stencil_dyn_rlwimi),
+                            packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                            0, mask};
+  }
+
+  // 7. rlwinm (primary 21, Rc == 0)
   if (primary_op == 21 && op.inst.Rc == 0)
   {
     const u32 mask = MakeRotationMask(op.inst.MB, op.inst.ME);
@@ -991,213 +1084,834 @@ StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
                       (static_cast<uint64_t>(op.inst.RD) << 40) |
                       (static_cast<uint64_t>(ror_amt) << 32) |
                       mask;
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_rlwinm), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Rlwinm, reinterpret_cast<const u8*>(&stencil_dyn_rlwinm),
+                            packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                            0, mask};
   }
 
-  // 8. cmpli (primary 10): Compare Logical Immediate
+  // 8. cmpli (primary 10)
   if (primary_op == 10)
   {
     const u16 uimm = op.inst.UIMM;
     uint64_t packed = (static_cast<uint64_t>(op.inst.CRFD) << 24) |
                       (static_cast<uint64_t>(op.inst.RA) << 16) |
                       uimm;
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_cmplwi), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Cmplwi, reinterpret_cast<const u8*>(&stencil_dyn_cmplwi),
+                            packed, static_cast<u8>(op.inst.CRFD), static_cast<u8>(op.inst.RA),
+                            0, uimm};
   }
 
-  // 9. cmpi (primary 11): Compare Immediate
+  // 9. cmpi (primary 11)
   if (primary_op == 11)
   {
     const s16 simm = static_cast<s16>(op.inst.SIMM_16);
     uint64_t packed = (static_cast<uint64_t>(op.inst.CRFD) << 24) |
                       (static_cast<uint64_t>(op.inst.RA) << 16) |
                       static_cast<uint16_t>(simm);
-    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_cmpwi), packed, op.address, op.canEndBlock};
+    return DecodedStencilOp{StencilOpType::Cmpwi, reinterpret_cast<const u8*>(&stencil_dyn_cmpwi),
+                            packed, static_cast<u8>(op.inst.CRFD), static_cast<u8>(op.inst.RA),
+                            0, static_cast<u32>(static_cast<s32>(simm))};
   }
 
   // 10. Primary 31 ALU, logical, and compare operations (Rc == 0)
   if (primary_op == 31 && op.inst.Rc == 0)
   {
     const u32 subop = op.inst.SUBOP10;
-    // cmp (0): Compare Signed
     if (subop == 0)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.CRFD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_cmp), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Cmp, reinterpret_cast<const u8*>(&stencil_dyn_cmp),
+                              packed, static_cast<u8>(op.inst.CRFD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // cmpl (32): Compare Logical
     if (subop == 32)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.CRFD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_cmpl), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Cmpl, reinterpret_cast<const u8*>(&stencil_dyn_cmpl),
+                              packed, static_cast<u8>(op.inst.CRFD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // add (266): RD = RA + RB
     if (subop == 266)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_add), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Add, reinterpret_cast<const u8*>(&stencil_dyn_add),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // subf (40): RD = RB - RA
     if (subop == 40)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_subf), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Subf, reinterpret_cast<const u8*>(&stencil_dyn_subf),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // or (444): RA = RS | RB. Note: mr rA, rS is or rA, rS, rS
     if (subop == 444)
     {
       if (op.inst.RD == op.inst.RB) // mr rA, rS
       {
         uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                           (static_cast<uint64_t>(op.inst.RD) << 16);
-        return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_mr), packed, op.address, op.canEndBlock};
+        return DecodedStencilOp{StencilOpType::Mr, reinterpret_cast<const u8*>(&stencil_dyn_mr),
+                                packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                                0, 0};
       }
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_or), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Or, reinterpret_cast<const u8*>(&stencil_dyn_or),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-
-    // and (28): RA = RS & RB
     if (subop == 28)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_and), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::And, reinterpret_cast<const u8*>(&stencil_dyn_and),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // xor (316): RA = RS ^ RB
     if (subop == 316)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_xor), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Xor, reinterpret_cast<const u8*>(&stencil_dyn_xor),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // nor (124): RA = ~(RS | RB)
     if (subop == 124)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_nor), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Nor, reinterpret_cast<const u8*>(&stencil_dyn_nor),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // slw (24): RA = RS << (RB & 31)
     if (subop == 24)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_slw), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Slw, reinterpret_cast<const u8*>(&stencil_dyn_slw),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // srw (536): RA = RS >> (RB & 31)
     if (subop == 536)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16) |
                         (static_cast<uint64_t>(op.inst.RB) << 8);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_srw), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Srw, reinterpret_cast<const u8*>(&stencil_dyn_srw),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
     }
-    // neg (104): RD = -RA
     if (subop == 104)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_neg), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Neg, reinterpret_cast<const u8*>(&stencil_dyn_neg),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, 0};
     }
-    // extsb (954): RA = (s8)RS
     if (subop == 954)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_extsb), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Extsb, reinterpret_cast<const u8*>(&stencil_dyn_extsb),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              0, 0};
     }
-    // extsh (922): RA = (s16)RS
     if (subop == 922)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_extsh), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Extsh, reinterpret_cast<const u8*>(&stencil_dyn_extsh),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              0, 0};
     }
-    // cntlzw (26): RA = cntlzw(RS)
     if (subop == 26)
     {
       uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
                         (static_cast<uint64_t>(op.inst.RD) << 16);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_cntlzw), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Cntlzw, reinterpret_cast<const u8*>(&stencil_dyn_cntlzw),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              0, 0};
     }
+    // sraw (792)
+    if (subop == 792)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
+                        (static_cast<uint64_t>(op.inst.RD) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Sraw, reinterpret_cast<const u8*>(&stencil_dyn_sraw),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // srawi (824)
+    if (subop == 824)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
+                        (static_cast<uint64_t>(op.inst.RD) << 16) |
+                        (op.inst.SH & 31);
+      return DecodedStencilOp{StencilOpType::Srawi, reinterpret_cast<const u8*>(&stencil_dyn_srawi),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              0, op.inst.SH};
+    }
+    // mullw (235)
+    if (subop == 235 && op.inst.OE == 0)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Mullw, reinterpret_cast<const u8*>(&stencil_dyn_mullw),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // lwzx (23)
+    if (!jo.memcheck && subop == 23)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Lwzx, reinterpret_cast<const u8*>(&stencil_dyn_lwzx),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // stwx (151)
+    if (!jo.memcheck && subop == 151)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Stwx, reinterpret_cast<const u8*>(&stencil_dyn_stwx),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // mfspr (339): mflr (8), mfctr (9)
+    if (subop == 339)
+    {
+      const u32 spr_idx = ((op.inst.SPR & 0x1F) << 5) | ((op.inst.SPR >> 5) & 0x1F);
+      if (spr_idx == 8)
+      {
+        uint64_t packed = static_cast<uint64_t>(op.inst.RD) << 24;
+        return DecodedStencilOp{StencilOpType::Mflr, reinterpret_cast<const u8*>(&stencil_dyn_mflr), packed,
+                                static_cast<u8>(op.inst.RD), 0, 0, 0};
+      }
+      if (spr_idx == 9)
+      {
+        uint64_t packed = static_cast<uint64_t>(op.inst.RD) << 24;
+        return DecodedStencilOp{StencilOpType::Mfctr, reinterpret_cast<const u8*>(&stencil_dyn_mfctr), packed,
+                                static_cast<u8>(op.inst.RD), 0, 0, 0};
+      }
+    }
+    // mtspr (467): mtlr (8), mtctr (9)
+    if (subop == 467)
+    {
+      const u32 spr_idx = ((op.inst.SPR & 0x1F) << 5) | ((op.inst.SPR >> 5) & 0x1F);
+      if (spr_idx == 8)
+      {
+        uint64_t packed = static_cast<uint64_t>(op.inst.RD) << 24;
+        return DecodedStencilOp{StencilOpType::Mtlr, reinterpret_cast<const u8*>(&stencil_dyn_mtlr), packed,
+                                static_cast<u8>(op.inst.RD), 0, 0, 0};
+      }
+      if (spr_idx == 9)
+      {
+        uint64_t packed = static_cast<uint64_t>(op.inst.RD) << 24;
+        return DecodedStencilOp{StencilOpType::Mtctr, reinterpret_cast<const u8*>(&stencil_dyn_mtctr), packed,
+                                static_cast<u8>(op.inst.RD), 0, 0, 0};
+      }
+    }
+    // mfmsr (83)
+    if (subop == 83)
+    {
+      uint64_t packed = static_cast<uint64_t>(op.inst.RD) << 24;
+      return DecodedStencilOp{StencilOpType::Mfmsr, reinterpret_cast<const u8*>(&stencil_dyn_mfmsr), packed,
+                              static_cast<u8>(op.inst.RD), 0, 0, 0};
+    }
+    // dcbi (470)
+    if (subop == 470)
+    {
+      return DecodedStencilOp{StencilOpType::Dcbi, reinterpret_cast<const u8*>(&stencil_dyn_dcbi), 0,
+                              0, 0, 0, 0};
+    }
+    // andc (60): rA = rS & ~rB
+    if (subop == 60)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
+                        (static_cast<uint64_t>(op.inst.RD) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Andc, reinterpret_cast<const u8*>(&stencil_dyn_andc),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // orc (412): rA = rS | ~rB
+    if (subop == 412)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
+                        (static_cast<uint64_t>(op.inst.RD) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Orc, reinterpret_cast<const u8*>(&stencil_dyn_orc),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // nand (476): rA = ~(rS & rB)
+    if (subop == 476)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
+                        (static_cast<uint64_t>(op.inst.RD) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Nand, reinterpret_cast<const u8*>(&stencil_dyn_nand),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // eqv (284): rA = ~(rS ^ rB)
+    if (subop == 284)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RA) << 24) |
+                        (static_cast<uint64_t>(op.inst.RD) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Eqv, reinterpret_cast<const u8*>(&stencil_dyn_eqv),
+                              packed, static_cast<u8>(op.inst.RA), static_cast<u8>(op.inst.RD),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // divw (491): rD = rA / rB (signed)
+    if (subop == 491 && op.inst.OE == 0)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Divw, reinterpret_cast<const u8*>(&stencil_dyn_divw),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // divwu (459): rD = rA / rB (unsigned)
+    if (subop == 459 && op.inst.OE == 0)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Divwu, reinterpret_cast<const u8*>(&stencil_dyn_divwu),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // mulhw (75): rD = (rA * rB) >> 32 (signed)
+    if (subop == 75 && op.inst.OE == 0)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Mulhw, reinterpret_cast<const u8*>(&stencil_dyn_mulhw),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+    // mulhwu (11): rD = (rA * rB) >> 32 (unsigned)
+    if (subop == 11 && op.inst.OE == 0)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        (static_cast<uint64_t>(op.inst.RB) << 8);
+      return DecodedStencilOp{StencilOpType::Mulhwu, reinterpret_cast<const u8*>(&stencil_dyn_mulhwu),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              static_cast<u8>(op.inst.RB), 0};
+    }
+  }
+
+  // Primary 19: bclr / blr
+  if (primary_op == 19 && op.inst.SUBOP10 == 16)
+  {
+    return DecodedStencilOp{StencilOpType::Blr, nullptr, 0, 0, 0, 0, 0};
   }
 
   if (!jo.memcheck)
   {
-    // 11. lbz (primary 34): RD = [RA + SIMM_16]
+    // lbz (34)
     if (primary_op == 34)
     {
       const s16 simm = static_cast<s16>(op.inst.SIMM_16);
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         static_cast<uint16_t>(simm);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_lbz), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Lbz, reinterpret_cast<const u8*>(&stencil_dyn_lbz),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
     }
-
-    // 12. lhz (primary 40): RD = [RA + SIMM_16]
+    // lbzu (35)
+    if (primary_op == 35)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return DecodedStencilOp{StencilOpType::Lbzu, reinterpret_cast<const u8*>(&stencil_dyn_lbzu),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
+    }
+    // lhz (40)
     if (primary_op == 40)
     {
       const s16 simm = static_cast<s16>(op.inst.SIMM_16);
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         static_cast<uint16_t>(simm);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_lhz), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Lhz, reinterpret_cast<const u8*>(&stencil_dyn_lhz),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
     }
-
-    // 13. lwz (primary 32): RD = [RA + SIMM_16]
+    // lwz (32)
     if (primary_op == 32)
     {
       const s16 simm = static_cast<s16>(op.inst.SIMM_16);
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         static_cast<uint16_t>(simm);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_lwz), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Lwz, reinterpret_cast<const u8*>(&stencil_dyn_lwz),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
     }
-
-    // 14. stw (primary 36): [RA + SIMM_16] = RS
+    // stw (36)
     if (primary_op == 36)
     {
       const s16 simm = static_cast<s16>(op.inst.SIMM_16);
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         static_cast<uint16_t>(simm);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_stw), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Stw, reinterpret_cast<const u8*>(&stencil_dyn_stw),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
     }
-
-    // 15. stb (primary 38): [RA + SIMM_16] = RS
+    // stb (38)
     if (primary_op == 38)
     {
       const s16 simm = static_cast<s16>(op.inst.SIMM_16);
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         static_cast<uint16_t>(simm);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_stb), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Stb, reinterpret_cast<const u8*>(&stencil_dyn_stb),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
     }
-
-    // 16. sth (primary 44): [RA + SIMM_16] = RS
+    // sth (44)
     if (primary_op == 44)
     {
       const s16 simm = static_cast<s16>(op.inst.SIMM_16);
       uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
                         (static_cast<uint64_t>(op.inst.RA) << 16) |
                         static_cast<uint16_t>(simm);
-      return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_sth), packed, op.address, op.canEndBlock};
+      return DecodedStencilOp{StencilOpType::Sth, reinterpret_cast<const u8*>(&stencil_dyn_sth),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
+    }
+    // stwu (37)
+    if (primary_op == 37)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.RD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return DecodedStencilOp{StencilOpType::Stwu, reinterpret_cast<const u8*>(&stencil_dyn_stwu),
+                              packed, static_cast<u8>(op.inst.RD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
+    }
+    // lfs (48)
+    if (primary_op == 48)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return DecodedStencilOp{StencilOpType::Lfs, reinterpret_cast<const u8*>(&stencil_dyn_lfs),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
+    }
+    // lfd (50)
+    if (primary_op == 50)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return DecodedStencilOp{StencilOpType::Lfd, reinterpret_cast<const u8*>(&stencil_dyn_lfd),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
+    }
+    // stfs (52)
+    if (primary_op == 52)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FS) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return DecodedStencilOp{StencilOpType::Stfs, reinterpret_cast<const u8*>(&stencil_dyn_stfs),
+                              packed, static_cast<u8>(op.inst.FS), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
+    }
+    // stfd (54)
+    if (primary_op == 54)
+    {
+      const s16 simm = static_cast<s16>(op.inst.SIMM_16);
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FS) << 24) |
+                        (static_cast<uint64_t>(op.inst.RA) << 16) |
+                        static_cast<uint16_t>(simm);
+      return DecodedStencilOp{StencilOpType::Stfd, reinterpret_cast<const u8*>(&stencil_dyn_stfd),
+                              packed, static_cast<u8>(op.inst.FS), static_cast<u8>(op.inst.RA),
+                              0, static_cast<u32>(static_cast<s32>(simm))};
     }
   }
 
+  // Primary 4: Paired Single SIMD Operations
+  if (primary_op == 4 && op.inst.Rc == 0)
+  {
+    const u32 subop10 = op.inst.SUBOP10;
+    const u32 subop5 = op.inst.SUBOP5;
+
+    // SUBOP10 operations
+    if (subop10 == 40) // ps_neg
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsNeg, reinterpret_cast<const u8*>(&stencil_dyn_ps_neg),
+                              packed, static_cast<u8>(op.inst.FD), 0, static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 264) // ps_abs
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsAbs, reinterpret_cast<const u8*>(&stencil_dyn_ps_abs),
+                              packed, static_cast<u8>(op.inst.FD), 0, static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 136) // ps_nabs
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsNabs, reinterpret_cast<const u8*>(&stencil_dyn_ps_nabs),
+                              packed, static_cast<u8>(op.inst.FD), 0, static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 528) // ps_merge00
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsMerge00, reinterpret_cast<const u8*>(&stencil_dyn_ps_merge00),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 560) // ps_merge01
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsMerge01, reinterpret_cast<const u8*>(&stencil_dyn_ps_merge01),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 592) // ps_merge10
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsMerge10, reinterpret_cast<const u8*>(&stencil_dyn_ps_merge10),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 624) // ps_merge11
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsMerge11, reinterpret_cast<const u8*>(&stencil_dyn_ps_merge11),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+
+    // SUBOP5 operations
+    if (subop5 == 21) // ps_add
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsAdd, reinterpret_cast<const u8*>(&stencil_dyn_ps_add),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 20) // ps_sub
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsSub, reinterpret_cast<const u8*>(&stencil_dyn_ps_sub),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 25) // ps_mul (FA * FC)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::PsMul, reinterpret_cast<const u8*>(&stencil_dyn_ps_mul),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), 0, static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 18) // ps_div
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::PsDiv, reinterpret_cast<const u8*>(&stencil_dyn_ps_div),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 29) // ps_madd (FA * FC + FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::PsMadd, reinterpret_cast<const u8*>(&stencil_dyn_ps_madd),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 28) // ps_msub (FA * FC - FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::PsMsub, reinterpret_cast<const u8*>(&stencil_dyn_ps_msub),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+  }
+
+  // Primary 59: Single-Precision FP
+  if (primary_op == 59 && op.inst.Rc == 0)
+  {
+    const u32 subop5 = op.inst.SUBOP5;
+    if (subop5 == 21) // fadds
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fadds, reinterpret_cast<const u8*>(&stencil_dyn_fadds),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 20) // fsubs
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fsubs, reinterpret_cast<const u8*>(&stencil_dyn_fsubs),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 25) // fmuls (FA * FC)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fmuls, reinterpret_cast<const u8*>(&stencil_dyn_fmuls),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), 0, static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 18) // fdivs
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fdivs, reinterpret_cast<const u8*>(&stencil_dyn_fdivs),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 29) // fmadds (FA * FC + FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fmadds, reinterpret_cast<const u8*>(&stencil_dyn_fmadds),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 28) // fmsubs (FA * FC - FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fmsubs, reinterpret_cast<const u8*>(&stencil_dyn_fmsubs),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+  }
+
+  // Primary 63: Double-Precision FP
+  if (primary_op == 63 && op.inst.Rc == 0)
+  {
+    const u32 subop10 = op.inst.SUBOP10;
+    const u32 subop5 = op.inst.SUBOP5;
+
+    // SUBOP10
+    if (subop10 == 72) // fmr
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fmr, reinterpret_cast<const u8*>(&stencil_dyn_fmr),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FB), 0, 0};
+    }
+    if (subop10 == 264) // fabs
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fabs, reinterpret_cast<const u8*>(&stencil_dyn_fabs),
+                              packed, static_cast<u8>(op.inst.FD), 0, static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 40) // fneg
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fneg, reinterpret_cast<const u8*>(&stencil_dyn_fneg),
+                              packed, static_cast<u8>(op.inst.FD), 0, static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop10 == 136) // fnabs
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fnabs, reinterpret_cast<const u8*>(&stencil_dyn_fnabs),
+                              packed, static_cast<u8>(op.inst.FD), 0, static_cast<u8>(op.inst.FB), 0};
+    }
+
+    // SUBOP5
+    if (subop5 == 21) // fadd
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fadd, reinterpret_cast<const u8*>(&stencil_dyn_fadd),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 20) // fsub
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fsub, reinterpret_cast<const u8*>(&stencil_dyn_fsub),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 25) // fmul (FA * FC)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fmul, reinterpret_cast<const u8*>(&stencil_dyn_fmul),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), 0, static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 18) // fdiv
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8);
+      return DecodedStencilOp{StencilOpType::Fdiv, reinterpret_cast<const u8*>(&stencil_dyn_fdiv),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), 0};
+    }
+    if (subop5 == 23) // fsel (if FA >= 0.0 then FC else FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fsel, reinterpret_cast<const u8*>(&stencil_dyn_fsel),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 29) // fmadd (FA * FC + FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fmadd, reinterpret_cast<const u8*>(&stencil_dyn_fmadd),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+    if (subop5 == 28) // fmsub (FA * FC - FB)
+    {
+      uint64_t packed = (static_cast<uint64_t>(op.inst.FD) << 24) |
+                        (static_cast<uint64_t>(op.inst.FA) << 16) |
+                        (static_cast<uint64_t>(op.inst.FB) << 8) |
+                        (static_cast<uint64_t>(op.inst.FC));
+      return DecodedStencilOp{StencilOpType::Fmsub, reinterpret_cast<const u8*>(&stencil_dyn_fmsub),
+                              packed, static_cast<u8>(op.inst.FD), static_cast<u8>(op.inst.FA), static_cast<u8>(op.inst.FB), static_cast<u32>(op.inst.FC)};
+    }
+  }
+
+#endif
+  return std::nullopt;
+}
+
+std::optional<StencilInterpreter::StencilTapeItem>
+StencilInterpreter::TryEmitStencil(const PPCAnalyst::CodeOp& op)
+{
+  auto decoded = DecodeStencilOp(op);
+  if (!decoded || !decoded->stencil_fn)
+    return std::nullopt;
+  return StencilTapeItem{decoded->stencil_fn, decoded->packed_operand, op.address, op.canEndBlock};
+}
+
+std::optional<StencilInterpreter::StencilTapeItem>
+StencilInterpreter::TryEmitSuperStencil(const PPCAnalyst::CodeOp& op1, const PPCAnalyst::CodeOp& op2)
+{
+#if defined(__aarch64__) || defined(_M_ARM64)
+  if (op1.canEndBlock)
+    return std::nullopt;
+
+  auto d1 = DecodeStencilOp(op1);
+  auto d2 = DecodeStencilOp(op2);
+  if (!d1 || !d2)
+    return std::nullopt;
+
+  const uint64_t packed = (static_cast<uint64_t>(d1->packed_operand) << 32) |
+                          (static_cast<uint64_t>(d2->packed_operand) & 0xFFFFFFFFULL);
+
+  // 1. Fused lwz + lwz
+  if (d1->type == StencilOpType::Lwz && d2->type == StencilOpType::Lwz)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_lwz_lwz),
+                           packed, op2.address, op2.canEndBlock};
+  }
+
+  // 2. Fused stw + stw
+  if (d1->type == StencilOpType::Stw && d2->type == StencilOpType::Stw)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_stw_stw),
+                           packed, op2.address, op2.canEndBlock};
+  }
+
+  // 3. Fused lis + addi (addis + addi where d2->ra == d1->rd)
+  if (d1->type == StencilOpType::Addis && d2->type == StencilOpType::Addi && d2->ra == d1->rd)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_lis_addi),
+                           packed, op2.address, op2.canEndBlock};
+  }
+
+  // 4. Fused lis + ori (addis + ori where d2->ra == d1->rd)
+  if (d1->type == StencilOpType::Addis && d2->type == StencilOpType::Ori && d2->ra == d1->rd)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_lis_ori),
+                           packed, op2.address, op2.canEndBlock};
+  }
+
+  // 5. Fused mr + mr
+  if (d1->type == StencilOpType::Mr && d2->type == StencilOpType::Mr)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_mr_mr),
+                           packed, op2.address, op2.canEndBlock};
+  }
+
+  // 6. Super ps_mul + ps_add
+  if (d1->type == StencilOpType::PsMul && d2->type == StencilOpType::PsAdd)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_ps_mul_ps_add),
+                           packed, op2.address, op2.canEndBlock};
+  }
+
+  // 7. Super ps_madd + ps_add
+  if (d1->type == StencilOpType::PsMadd && d2->type == StencilOpType::PsAdd)
+  {
+    return StencilTapeItem{reinterpret_cast<const u8*>(&stencil_dyn_super_ps_madd_ps_add),
+                           packed, op2.address, op2.canEndBlock};
+  }
 #endif
 
   return std::nullopt;
@@ -1293,6 +2007,21 @@ void StencilInterpreter::WriteEndBlock()
 s32 StencilInterpreter::ExecuteBlockLinkDirect(PowerPC::PowerPCState& ppc_state,
                                               const BlockLinkDirectOperands& operands)
 {
+  if (operands.return_address == 0xFFFFFFFF)
+  {
+    ppc_state.pc = ppc_state.spr[SPR_LR] & ~3;
+    ppc_state.npc = ppc_state.pc;
+    ppc_state.downcount -= operands.downcount_amount;
+    PowerPC::UpdatePerformanceMonitor(operands.downcount_amount, operands.num_load_stores,
+                                      operands.num_fp_inst, ppc_state);
+    if (DivergenceTracer::IsBlockTracingEnabled())
+      DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
+    return 0;
+  }
+
+  if (operands.return_address != 0)
+    ppc_state.spr[SPR_LR] = operands.return_address;
+
   ppc_state.pc = operands.destination;
   ppc_state.npc = operands.destination;
   ppc_state.downcount -= operands.downcount_amount;
@@ -1339,39 +2068,6 @@ s32 StencilInterpreter::ExecuteBlockLinkBranch(PowerPC::PowerPCState& ppc_state,
   if (DivergenceTracer::IsBlockTracingEnabled())
     DivergenceTracer::LogBlock(ppc_state.pc, ppc_state);
 
-  // Safe Multi-Block Idle Loop Detection:
-  // Only applies when determinism is not requested (keeps lockstep test 100% deterministic),
-  // and strictly for blocks with <= 1 load and 0 stores/floats (ensuring compute/decompression loops are never skipped).
-  if (!Core::WantsDeterminism() && operands.num_load_stores <= 1 && operands.num_fp_inst == 0)
-  {
-    thread_local u32 tl_target1 = 0;
-    thread_local u32 tl_target2 = 0;
-    thread_local u32 tl_ping_pong_count = 0;
-
-    if (taken && destination == tl_target1)
-    {
-      if (++tl_ping_pong_count >= 64)
-      {
-        tl_ping_pong_count = 0;
-        if (s_system_instance)
-          s_system_instance->GetCoreTiming().Idle();
-        return 0;
-      }
-      tl_target1 = tl_target2;
-      tl_target2 = destination;
-    }
-    else if (taken)
-    {
-      tl_target1 = tl_target2;
-      tl_target2 = destination;
-      tl_ping_pong_count = 0;
-    }
-    else
-    {
-      tl_ping_pong_count = 0;
-    }
-  }
-
   if (ppc_state.downcount <= 0)
     return 0;
 
@@ -1398,6 +2094,7 @@ bool StencilInterpreter::TryWriteBlockEnd(const PPCAnalyst::CodeOp& op, JitBlock
           .downcount_amount = js.downcountAmount,
           .num_load_stores = js.numLoadStoreInst,
           .num_fp_inst = js.numFloatingPointInst,
+          .return_address = 0,
       };
       Write(ExecuteBlockLinkDirect, link_operands);
 
@@ -1602,18 +2299,68 @@ bool StencilInterpreter::DoJit(u32 em_address, JitBlock* b, u32 nextPC)
 
     if (!op.skip)
     {
-      auto stencil_item = TryEmitStencil(op);
-      const bool can_stencil = stencil_item.has_value() &&
-                               (!IsDebuggingEnabled() || cpu.IsStepping() ||
-                                !breakpoints.IsAddressBreakPoint(js.compilerPC)) &&
-                               (js.firstFPInstructionFound || (op.opinfo->flags & FL_USE_FPU) == 0);
+      std::optional<StencilTapeItem> stencil_item;
+      bool fused = false;
 
+      // 1. Try fused super-instruction (2-op lookahead)
+      if ((i + 1 < code_block.m_num_instructions) && !m_code_buffer[i + 1].skip)
+      {
+        const PPCAnalyst::CodeOp& next_op = m_code_buffer[i + 1];
+        const bool can_super = (!IsDebuggingEnabled() || cpu.IsStepping() ||
+                                (!breakpoints.IsAddressBreakPoint(op.address) &&
+                                 !breakpoints.IsAddressBreakPoint(next_op.address)));
+        if (can_super)
+        {
+          stencil_item = TryEmitSuperStencil(op, next_op);
+          if (stencil_item.has_value())
+          {
+            if (!js.firstFPInstructionFound &&
+                (((op.opinfo->flags & FL_USE_FPU) != 0) || ((next_op.opinfo->flags & FL_USE_FPU) != 0)))
+            {
+              flush_tape_run();
+              Write(CheckFPU, {power_pc, js.compilerPC, js.downcountAmount});
+              js.firstFPInstructionFound = true;
+            }
+            fused = true;
+          }
+        }
+      }
 
-      if (can_stencil)
+      // 2. Fall back to single stencil
+      if (!stencil_item.has_value())
+      {
+        auto single_item = TryEmitStencil(op);
+        const bool can_stencil = single_item.has_value() &&
+                                 (!IsDebuggingEnabled() || cpu.IsStepping() ||
+                                  !breakpoints.IsAddressBreakPoint(js.compilerPC));
+        if (can_stencil)
+        {
+          if (!js.firstFPInstructionFound && (op.opinfo->flags & FL_USE_FPU) != 0)
+          {
+            flush_tape_run();
+            Write(CheckFPU, {power_pc, js.compilerPC, js.downcountAmount});
+            js.firstFPInstructionFound = true;
+          }
+          stencil_item = single_item;
+        }
+      }
+
+      if (stencil_item.has_value())
       {
         tape_run.push_back(*stencil_item);
 
-        if (op.canEndBlock)
+        if (fused)
+        {
+          const PPCAnalyst::CodeOp& next_op = m_code_buffer[i + 1];
+          js.downcountAmount += next_op.opinfo->num_cycles;
+          if (next_op.opinfo->flags & FL_LOADSTORE)
+            ++js.numLoadStoreInst;
+          if (next_op.opinfo->flags & FL_USE_FPU)
+            ++js.numFloatingPointInst;
+          i++; // Advance past fused instruction
+        }
+
+        if (m_code_buffer[i].canEndBlock)
         {
           flush_tape_run();
           WriteEndBlock();

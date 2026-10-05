@@ -57,6 +57,7 @@ a642a64_run_stencil:
     add  x27, x19, #32   // ppc_state.gpr base pointer for branchless access
 
     // 4. Branch to stencil
+    ldr  x1, [x20, #8]
     br   x0
 
 // -------------------------------------------------------------
@@ -72,9 +73,14 @@ a642a64_run_stencil:
 .endm
 
 .macro STENCIL_TAILCALL
-    ldr   x16, [x20, #16]!
-    br    x16
+    b     __stencil_tailcall
 .endm
+
+.global __stencil_tailcall
+.type __stencil_tailcall, %function
+__stencil_tailcall:
+    ldp   x16, x1, [x20, #16]!
+    br    x16
 
 .global stencil_dyn_addi
 stencil_dyn_addi:
@@ -315,6 +321,22 @@ stencil_dyn_rlwinm:
     WRITE_GPR w0, w3
     STENCIL_TAILCALL
 
+.global stencil_dyn_rlwimi
+stencil_dyn_rlwimi:
+    ldr   x1, [x20, #8]
+    ubfx  w0, w1, #0,  #32
+    ubfx  x2, x1, #32, #5
+    ubfx  x4, x1, #40, #5
+    ubfx  x3, x1, #48, #5
+    READ_GPR w5, w4
+    READ_GPR w6, w3
+    ror   w5, w5, w2
+    and   w5, w5, w0
+    bic   w6, w6, w0
+    orr   w0, w6, w5
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
 .global stencil_dyn_mr
 stencil_dyn_mr:
     ldr   x1, [x20, #8]
@@ -425,6 +447,29 @@ stencil_dyn_lbz:
     b.ne  2f
     and   w0, w0, #0x01ffffff
     ldrb  w5, [x28, w0, uxtw]
+    WRITE_GPR w5, w3
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowReadU8
+    ldp   x3, x30, [sp], #16
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_lbzu
+stencil_dyn_lbzu:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w4, w2
+    add   w0, w4, w0
+    WRITE_GPR w0, w2
+    tst   w0, #0x3e000000
+    b.ne  2f
+    and   w4, w0, #0x01ffffff
+    ldrb  w5, [x28, w4, uxtw]
     WRITE_GPR w5, w3
     STENCIL_TAILCALL
 2:  stp   x3, x30, [sp, #-16]!
@@ -669,6 +714,7 @@ stencil_tape_direct_jump:
     cbz   x20, 20f                 // unlinked -> return to C++ to compile
 
     ldr   x16, [x1, #0]            // x16 = target.first_stencil
+    ldr   x1,  [x20, #8]           // x1 = target's first operand
     br    x16                      // Jump directly into target block!
 
 10: // Timeslice expired (w26 <= 0)
@@ -772,6 +818,7 @@ stencil_tape_cond_branch:
     cbz   x20, 20f                 // unlinked -> return to C++ to compile
 
     ldr   x16, [x1, #0]            // x16 = target.first_stencil
+    ldr   x1,  [x20, #8]           // x1 = target's first operand
     br    x16                      // Jump directly into target block!
 
 10: // Timeslice expired
@@ -781,4 +828,1079 @@ stencil_tape_cond_branch:
 20:
     b     a642a64_stencil_exit_nodec
 
+// ============================================================================
+// Super-Instructions (Macro-Instruction Fusion)
+// ============================================================================
+
+.macro DO_LWZ_OP reg_op
+    sbfx  w0, \reg_op, #0, #16
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w3, \reg_op, #24, #5
+    cbz   w2, 80f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+80: tst   w0, #0x3e000000
+    b.ne  81f
+    and   w0, w0, #0x01ffffff
+    ldr   w5, [x28, w0, uxtw]
+    rev   w5, w5
+    WRITE_GPR w5, w3
+    b     82f
+81:
+    stp   x1, x30, [sp, #-32]!
+    stp   x3, x6,  [sp, #16]
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowReadU32
+    ldp   x3, x6,  [sp, #16]
+    ldp   x1, x30, [sp], #32
+    WRITE_GPR w0, w3
+82:
+.endm
+
+.macro DO_STW_OP reg_op
+    sbfx  w0, \reg_op, #0, #16
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w3, \reg_op, #24, #5
+    cbz   w2, 83f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+83: tst   w0, #0x3e000000
+    b.ne  84f
+    and   w0, w0, #0x01ffffff
+    READ_GPR w5, w3
+    rev   w5, w5
+    str   w5, [x28, w0, uxtw]
+    b     85f
+84:
+    stp   x1, x30, [sp, #-32]!
+    str   x6,      [sp, #16]
+    READ_GPR w2, w3
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU32
+    ldr   x6,      [sp, #16]
+    ldp   x1, x30, [sp], #32
+85:
+.endm
+
+.macro DO_ADDIS_OP reg_op
+    sbfx  w0, \reg_op, #0, #16
+    lsl   w0, w0, #16
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w3, \reg_op, #24, #5
+    cbz   w2, 10f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+10: WRITE_GPR w0, w3
+.endm
+
+.macro DO_ADDI_OP reg_op
+    sbfx  w0, \reg_op, #0, #16
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w3, \reg_op, #24, #5
+    cbz   w2, 10f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+10: WRITE_GPR w0, w3
+.endm
+
+.macro DO_ORI_OP reg_op
+    ubfx  w0, \reg_op, #0, #16
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w3, \reg_op, #24, #5
+    READ_GPR w4, w2
+    orr   w0, w4, w0
+    WRITE_GPR w0, w3
+.endm
+
+.macro DO_MR_OP reg_op
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w3, \reg_op, #24, #5
+    READ_GPR w0, w2
+    WRITE_GPR w0, w3
+.endm
+
+.global stencil_dyn_super_lwz_lwz
+stencil_dyn_super_lwz_lwz:
+    ldr   x1, [x20, #8]
+    lsr   x6, x1, #32
+    DO_LWZ_OP w6
+    DO_LWZ_OP w1
+    STENCIL_TAILCALL
+
+.global stencil_dyn_super_stw_stw
+stencil_dyn_super_stw_stw:
+    ldr   x1, [x20, #8]
+    lsr   x6, x1, #32
+    DO_STW_OP w6
+    DO_STW_OP w1
+    STENCIL_TAILCALL
+
+.global stencil_dyn_super_lis_addi
+stencil_dyn_super_lis_addi:
+    ldr   x1, [x20, #8]
+    lsr   x6, x1, #32
+    DO_ADDIS_OP w6
+    DO_ADDI_OP w1
+    STENCIL_TAILCALL
+
+.global stencil_dyn_super_lis_ori
+stencil_dyn_super_lis_ori:
+    ldr   x1, [x20, #8]
+    lsr   x6, x1, #32
+    DO_ADDIS_OP w6
+    DO_ORI_OP w1
+    STENCIL_TAILCALL
+
+.global stencil_dyn_super_mr_mr
+stencil_dyn_super_mr_mr:
+    ldr   x1, [x20, #8]
+    lsr   x6, x1, #32
+    DO_MR_OP w6
+    DO_MR_OP w1
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mflr
+stencil_dyn_mflr:
+    ldr   x1, [x20, #8]
+    ubfx  w3, w1, #24, #5
+    ldr   w0, [x19, #864]
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mtlr
+stencil_dyn_mtlr:
+    ldr   x1, [x20, #8]
+    ubfx  w3, w1, #24, #5
+    READ_GPR w0, w3
+    str   w0, [x19, #864]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_stwu
+stencil_dyn_stwu:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w4, w2
+    add   w0, w4, w0
+    WRITE_GPR w0, w2
+    tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    READ_GPR w5, w3
+    rev   w5, w5
+    str   w5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    READ_GPR w2, w3
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU32
+    ldp   x3, x30, [sp], #16
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mulli
+stencil_dyn_mulli:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w4, w2
+    mul   w0, w4, w0
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mullw
+stencil_dyn_mullw:
+    ldr   x1, [x20, #8]
+    ubfx  w4, w1, #8, #5
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w4
+    READ_GPR w4, w2
+    mul   w0, w4, w5
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_lwzx
+stencil_dyn_lwzx:
+    ldr   x1, [x20, #8]
+    ubfx  w4, w1, #8, #5
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w0, w4
+    cbz   w2, 1f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    ldr   w5, [x28, w0, uxtw]
+    rev   w5, w5
+    WRITE_GPR w5, w3
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowReadU32
+    ldp   x3, x30, [sp], #16
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_stwx
+stencil_dyn_stwx:
+    ldr   x1, [x20, #8]
+    ubfx  w4, w1, #8, #5
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w0, w4
+    cbz   w2, 1f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    READ_GPR w5, w3
+    rev   w5, w5
+    str   w5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    READ_GPR w2, w3
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU32
+    ldp   x3, x30, [sp], #16
+    STENCIL_TAILCALL
+
+.global stencil_dyn_lfs
+stencil_dyn_lfs:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    cbz   w2, 1f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    ldr   w5, [x28, w0, uxtw]
+    rev   w5, w5
+    fmov  s0, w5
+    fcvt  d0, s0
+    add   x6, x19, #160
+    add   x6, x6, x3, lsl #4
+    stp   d0, d0, [x6]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowReadU32
+    fmov  s0, w0
+    fcvt  d0, s0
+    ldr   x3, [sp]
+    add   x6, x19, #160
+    add   x6, x6, x3, lsl #4
+    stp   d0, d0, [x6]
+    ldp   x3, x30, [sp], #16
+    STENCIL_TAILCALL
+
+.global stencil_dyn_stfs
+stencil_dyn_stfs:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    cbz   w2, 1f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+1:  add   x6, x19, #160
+    add   x6, x6, x3, lsl #4
+    ldr   d0, [x6]
+    fcvt  s0, d0
+    fmov  w5, s0
+    tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    rev   w5, w5
+    str   w5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    mov   w2, w5
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU32
+    ldp   x3, x30, [sp], #16
+    STENCIL_TAILCALL
+
+.global stencil_dyn_lfd
+stencil_dyn_lfd:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    cbz   w2, 1f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+1:  tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    ldr   x5, [x28, w0, uxtw]
+    rev   x5, x5
+    add   x6, x19, #160
+    add   x6, x6, x3, lsl #4
+    str   x5, [x6]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowReadU64
+    ldr   x3, [sp]
+    add   x6, x19, #160
+    add   x6, x6, x3, lsl #4
+    str   x0, [x6]
+    ldp   x3, x30, [sp], #16
+    STENCIL_TAILCALL
+
+.global stencil_dyn_stfd
+stencil_dyn_stfd:
+    ldr   x1, [x20, #8]
+    sbfx  w0, w1, #0, #16
+    ubfx  w2, w1, #16, #5
+    ubfx  w3, w1, #24, #5
+    cbz   w2, 1f
+    READ_GPR w4, w2
+    add   w0, w4, w0
+1:  add   x6, x19, #160
+    add   x6, x6, x3, lsl #4
+    ldr   x5, [x6]
+    tst   w0, #0x3e000000
+    b.ne  2f
+    and   w0, w0, #0x01ffffff
+    rev   x5, x5
+    str   x5, [x28, w0, uxtw]
+    STENCIL_TAILCALL
+2:  stp   x3, x30, [sp, #-16]!
+    mov   x2, x5
+    mov   w1, w0
+    mov   x0, x19
+    bl    Stencil_SlowWriteU64
+    ldp   x3, x30, [sp], #16
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmr
+stencil_dyn_fmr:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8, #5
+    ubfx  w3, w1, #24, #5
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x3, lsl #4
+    str   d0, [x8]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mtctr
+stencil_dyn_mtctr:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #24, #5
+    READ_GPR w0, w2
+    str   w0, [x19, #868]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mfctr
+stencil_dyn_mfctr:
+    ldr   x1, [x20, #8]
+    ubfx  w3, w1, #24, #5
+    ldr   w0, [x19, #868]
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mfmsr
+stencil_dyn_mfmsr:
+    ldr   x1, [x20, #8]
+    ubfx  w3, w1, #24, #5
+    ldr   w0, [x19, #736]
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_dcbi
+stencil_dyn_dcbi:
+    STENCIL_TAILCALL
+
+// ============================================================================
+// Gekko Paired-Single SIMD Stencils (OP4)
+// ============================================================================
+
+.global stencil_dyn_ps_add
+stencil_dyn_ps_add:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    fadd  d0, d0, d2
+    fadd  d1, d1, d3
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_sub
+stencil_dyn_ps_sub:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    fsub  d0, d0, d2
+    fsub  d1, d1, d3
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_mul
+stencil_dyn_ps_mul:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    fmul  d0, d0, d2
+    fmul  d1, d1, d3
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_div
+stencil_dyn_ps_div:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    fdiv  d0, d0, d2
+    fdiv  d1, d1, d3
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_madd
+stencil_dyn_ps_madd:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    add   x10, x6, x5, lsl #4
+    ldp   d4, d5, [x10]
+    fmadd d0, d0, d2, d4
+    fmadd d1, d1, d3, d5
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_msub
+stencil_dyn_ps_msub:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    add   x10, x6, x5, lsl #4
+    ldp   d4, d5, [x10]
+    fnmsub d0, d0, d2, d4
+    fnmsub d1, d1, d3, d5
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_neg
+stencil_dyn_ps_neg:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    fneg  d0, d0
+    fneg  d1, d1
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_abs
+stencil_dyn_ps_abs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    fabs  d0, d0
+    fabs  d1, d1
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_nabs
+stencil_dyn_ps_nabs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    fabs  d0, d0
+    fneg  d0, d0
+    fabs  d1, d1
+    fneg  d1, d1
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_merge00
+stencil_dyn_ps_merge00:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_merge01
+stencil_dyn_ps_merge01:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8, #8]
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_merge10
+stencil_dyn_ps_merge10:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7, #8]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_ps_merge11
+stencil_dyn_ps_merge11:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7, #8]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8, #8]
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+    STENCIL_TAILCALL
+
+// ============================================================================
+// Single-Precision Floating Point Stencils (OP59)
+// ============================================================================
+
+.global stencil_dyn_fadds
+stencil_dyn_fadds:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fadd  d0, d0, d1
+    fcvt  s0, d0
+    fcvt  d0, s0
+    add   x9, x6, x3, lsl #4
+    stp   d0, d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fsubs
+stencil_dyn_fsubs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fsub  d0, d0, d1
+    fcvt  s0, d0
+    fcvt  d0, s0
+    add   x9, x6, x3, lsl #4
+    stp   d0, d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmuls
+stencil_dyn_fmuls:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fmul  d0, d0, d1
+    fcvt  s0, d0
+    fcvt  d0, s0
+    add   x9, x6, x3, lsl #4
+    stp   d0, d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fdivs
+stencil_dyn_fdivs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fdiv  d0, d0, d1
+    fcvt  s0, d0
+    fcvt  d0, s0
+    add   x9, x6, x3, lsl #4
+    stp   d0, d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmadds
+stencil_dyn_fmadds:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    add   x10, x6, x5, lsl #4
+    ldr   d2, [x10]
+    fmadd d0, d0, d1, d2
+    fcvt  s0, d0
+    fcvt  d0, s0
+    add   x9, x6, x3, lsl #4
+    stp   d0, d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmsubs
+stencil_dyn_fmsubs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    add   x10, x6, x5, lsl #4
+    ldr   d2, [x10]
+    fnmsub d0, d0, d1, d2
+    fcvt  s0, d0
+    fcvt  d0, s0
+    add   x9, x6, x3, lsl #4
+    stp   d0, d0, [x9]
+    STENCIL_TAILCALL
+
+// ============================================================================
+// Double-Precision Floating Point Stencils (OP63)
+// ============================================================================
+
+.global stencil_dyn_fadd
+stencil_dyn_fadd:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fadd  d0, d0, d1
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fsub
+stencil_dyn_fsub:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fsub  d0, d0, d1
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmul
+stencil_dyn_fmul:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fmul  d0, d0, d1
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fdiv
+stencil_dyn_fdiv:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    fdiv  d0, d0, d1
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmadd
+stencil_dyn_fmadd:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    add   x10, x6, x5, lsl #4
+    ldr   d2, [x10]
+    fmadd d0, d0, d1, d2
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fmsub
+stencil_dyn_fmsub:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]
+    add   x10, x6, x5, lsl #4
+    ldr   d2, [x10]
+    fnmsub d0, d0, d1, d2
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fabs
+stencil_dyn_fabs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    fabs  d0, d0
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fneg
+stencil_dyn_fneg:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    fneg  d0, d0
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fnabs
+stencil_dyn_fnabs:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]
+    fabs  d0, d0
+    fneg  d0, d0
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+.global stencil_dyn_fsel
+stencil_dyn_fsel:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5    // FA
+    ubfx  w4, w1, #0,  #5    // FC
+    ubfx  w5, w1, #8,  #5    // FB
+    ubfx  w3, w1, #24, #5    // FD
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldr   d0, [x7]           // FA
+    add   x8, x6, x4, lsl #4
+    ldr   d1, [x8]           // FC
+    add   x10, x6, x5, lsl #4
+    ldr   d2, [x10]          // FB
+    fcmp  d0, #0.0
+    fcsel d0, d1, d2, ge     // if FA >= 0.0 then FC else FB
+    add   x9, x6, x3, lsl #4
+    str   d0, [x9]
+    STENCIL_TAILCALL
+
+// ============================================================================
+// Additional Integer Stencils (OP31)
+// ============================================================================
+
+.global stencil_dyn_andc
+stencil_dyn_andc:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    bic   w0, w5, w6
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_orc
+stencil_dyn_orc:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    orn   w0, w5, w6
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_nand
+stencil_dyn_nand:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    and   w0, w5, w6
+    mvn   w0, w0
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_eqv
+stencil_dyn_eqv:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    eor   w0, w5, w6
+    mvn   w0, w0
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_divw
+stencil_dyn_divw:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    sdiv  w0, w5, w6
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_divwu
+stencil_dyn_divwu:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    udiv  w0, w5, w6
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mulhw
+stencil_dyn_mulhw:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    smull x0, w5, w6
+    lsr   x0, x0, #32
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+.global stencil_dyn_mulhwu
+stencil_dyn_mulhwu:
+    ldr   x1, [x20, #8]
+    ubfx  w2, w1, #16, #5
+    ubfx  w4, w1, #8,  #5
+    ubfx  w3, w1, #24, #5
+    READ_GPR w5, w2
+    READ_GPR w6, w4
+    umull x0, w5, w6
+    lsr   x0, x0, #32
+    WRITE_GPR w0, w3
+    STENCIL_TAILCALL
+
+// ============================================================================
+// Vertex Super-Instruction Stencils (Item 3)
+// ============================================================================
+
+.macro DO_PS_MUL_OP reg_op
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w4, \reg_op, #0,  #5
+    ubfx  w3, \reg_op, #24, #5
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    fmul  d0, d0, d2
+    fmul  d1, d1, d3
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+.endm
+
+.macro DO_PS_ADD_OP reg_op
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w4, \reg_op, #8,  #5
+    ubfx  w3, \reg_op, #24, #5
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    fadd  d0, d0, d2
+    fadd  d1, d1, d3
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+.endm
+
+.macro DO_PS_MADD_OP reg_op
+    ubfx  w2, \reg_op, #16, #5
+    ubfx  w4, \reg_op, #0,  #5
+    ubfx  w5, \reg_op, #8,  #5
+    ubfx  w3, \reg_op, #24, #5
+    add   x6, x19, #160
+    add   x7, x6, x2, lsl #4
+    ldp   d0, d1, [x7]
+    add   x8, x6, x4, lsl #4
+    ldp   d2, d3, [x8]
+    add   x10, x6, x5, lsl #4
+    ldp   d4, d5, [x10]
+    fmadd d0, d0, d2, d4
+    fmadd d1, d1, d3, d5
+    add   x9, x6, x3, lsl #4
+    stp   d0, d1, [x9]
+.endm
+
+.global stencil_dyn_super_ps_mul_ps_add
+stencil_dyn_super_ps_mul_ps_add:
+    ldr   x1, [x20, #8]
+    lsr   x11, x1, #32
+    DO_PS_MUL_OP w11
+    DO_PS_ADD_OP w1
+    STENCIL_TAILCALL
+
+.global stencil_dyn_super_ps_madd_ps_add
+stencil_dyn_super_ps_madd_ps_add:
+    ldr   x1, [x20, #8]
+    lsr   x11, x1, #32
+    DO_PS_MADD_OP w11
+    DO_PS_ADD_OP w1
+    STENCIL_TAILCALL
+
 #endif
+

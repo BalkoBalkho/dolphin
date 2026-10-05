@@ -50,6 +50,78 @@ void stencil_tape_jump();
 void a642a64_stencil_exit_nodec();
 void stencil_tape_direct_jump();
 void stencil_tape_cond_branch();
+void stencil_dyn_super_lwz_lwz();
+void stencil_dyn_super_stw_stw();
+void stencil_dyn_super_lis_addi();
+void stencil_dyn_super_lis_ori();
+void stencil_dyn_super_mr_mr();
+void stencil_dyn_mflr();
+void stencil_dyn_mtlr();
+void stencil_dyn_stwu();
+void stencil_dyn_mulli();
+void stencil_dyn_mullw();
+void stencil_dyn_lwzx();
+void stencil_dyn_stwx();
+void stencil_dyn_lfs();
+void stencil_dyn_stfs();
+void stencil_dyn_lfd();
+void stencil_dyn_stfd();
+void stencil_dyn_fmr();
+void stencil_dyn_rlwimi();
+void stencil_dyn_lbzu();
+void stencil_dyn_mtctr();
+void stencil_dyn_mfctr();
+void stencil_dyn_mfmsr();
+void stencil_dyn_dcbi();
+
+// Paired-Single SIMD stencils (OP4)
+void stencil_dyn_ps_add();
+void stencil_dyn_ps_sub();
+void stencil_dyn_ps_mul();
+void stencil_dyn_ps_div();
+void stencil_dyn_ps_madd();
+void stencil_dyn_ps_msub();
+void stencil_dyn_ps_neg();
+void stencil_dyn_ps_abs();
+void stencil_dyn_ps_nabs();
+void stencil_dyn_ps_merge00();
+void stencil_dyn_ps_merge01();
+void stencil_dyn_ps_merge10();
+void stencil_dyn_ps_merge11();
+
+// Single-Precision Floating Point stencils (OP59)
+void stencil_dyn_fadds();
+void stencil_dyn_fsubs();
+void stencil_dyn_fmuls();
+void stencil_dyn_fdivs();
+void stencil_dyn_fmadds();
+void stencil_dyn_fmsubs();
+
+// Double-Precision Floating Point stencils (OP63)
+void stencil_dyn_fadd();
+void stencil_dyn_fsub();
+void stencil_dyn_fmul();
+void stencil_dyn_fdiv();
+void stencil_dyn_fmadd();
+void stencil_dyn_fmsub();
+void stencil_dyn_fabs();
+void stencil_dyn_fneg();
+void stencil_dyn_fnabs();
+void stencil_dyn_fsel();
+
+// Additional Integer stencils (OP31)
+void stencil_dyn_andc();
+void stencil_dyn_orc();
+void stencil_dyn_nand();
+void stencil_dyn_eqv();
+void stencil_dyn_divw();
+void stencil_dyn_divwu();
+void stencil_dyn_mulhw();
+void stencil_dyn_mulhwu();
+
+// Vertex Super-Instruction Stencils (Item 3)
+void stencil_dyn_super_ps_mul_ps_add();
+void stencil_dyn_super_ps_madd_ps_add();
 }
 #else
 inline void a642a64_stencil_exit() {}
@@ -92,4 +164,64 @@ inline void stencil_dyn_cmp() {}
 inline void stencil_tape_jump() {}
 inline void stencil_tape_direct_jump() {}
 inline void stencil_tape_cond_branch() {}
+inline void stencil_dyn_super_lwz_lwz() {}
+inline void stencil_dyn_super_stw_stw() {}
+inline void stencil_dyn_super_mr_mr() {}
+inline void stencil_dyn_mflr() {}
+inline void stencil_dyn_mtlr() {}
+inline void stencil_dyn_stwu() {}
+inline void stencil_dyn_mulli() {}
+inline void stencil_dyn_mullw() {}
+inline void stencil_dyn_lwzx() {}
+inline void stencil_dyn_stwx() {}
+inline void stencil_dyn_lfs() {}
+inline void stencil_dyn_stfs() {}
+inline void stencil_dyn_lfd() {}
+inline void stencil_dyn_stfd() {}
+inline void stencil_dyn_fmr() {}
+inline void stencil_dyn_rlwimi() {}
+inline void stencil_dyn_lbzu() {}
+inline void stencil_dyn_mtctr() {}
+inline void stencil_dyn_mfctr() {}
+inline void stencil_dyn_mfmsr() {}
+inline void stencil_dyn_dcbi() {}
+inline void stencil_dyn_ps_add() {}
+inline void stencil_dyn_ps_sub() {}
+inline void stencil_dyn_ps_mul() {}
+inline void stencil_dyn_ps_div() {}
+inline void stencil_dyn_ps_madd() {}
+inline void stencil_dyn_ps_msub() {}
+inline void stencil_dyn_ps_neg() {}
+inline void stencil_dyn_ps_abs() {}
+inline void stencil_dyn_ps_nabs() {}
+inline void stencil_dyn_ps_merge00() {}
+inline void stencil_dyn_ps_merge01() {}
+inline void stencil_dyn_ps_merge10() {}
+inline void stencil_dyn_ps_merge11() {}
+inline void stencil_dyn_fadds() {}
+inline void stencil_dyn_fsubs() {}
+inline void stencil_dyn_fmuls() {}
+inline void stencil_dyn_fdivs() {}
+inline void stencil_dyn_fmadds() {}
+inline void stencil_dyn_fmsubs() {}
+inline void stencil_dyn_fadd() {}
+inline void stencil_dyn_fsub() {}
+inline void stencil_dyn_fmul() {}
+inline void stencil_dyn_fdiv() {}
+inline void stencil_dyn_fmadd() {}
+inline void stencil_dyn_fmsub() {}
+inline void stencil_dyn_fabs() {}
+inline void stencil_dyn_fneg() {}
+inline void stencil_dyn_fnabs() {}
+inline void stencil_dyn_fsel() {}
+inline void stencil_dyn_andc() {}
+inline void stencil_dyn_orc() {}
+inline void stencil_dyn_nand() {}
+inline void stencil_dyn_eqv() {}
+inline void stencil_dyn_divw() {}
+inline void stencil_dyn_divwu() {}
+inline void stencil_dyn_mulhw() {}
+inline void stencil_dyn_mulhwu() {}
+inline void stencil_dyn_super_ps_mul_ps_add() {}
+inline void stencil_dyn_super_ps_madd_ps_add() {}
 #endif

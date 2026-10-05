@@ -179,3 +179,65 @@ During lockstep parity verification between `StencilInterpreter` (Core 6) and `C
 3. **Path Forward to Recover 8.8+ FPS on Mobile:**
    - Gate the multi-block idle skip on `!Core::WantsDeterminism()` or a configuration setting (e.g. `SyncOnSkipIdle` / `JITIdleLoopOptimization`), so divergence testing runs 100% deterministic lockstep, while real gameplay on device uses idle skipping to fast-forward polling loops to 8.8+ FPS.
 
+---
+
+## 9. Comprehensive Field Notes: Stencil Interpreter, Divergence Architecture, & Android GFX (AGENTS Handover)
+
+### 9.1 Divergence Testing Tooling & CPUCore Trap
+- **Core Identifiers in Dolphin:**
+  - `CPUCore::Interpreter = 0`
+  - `CPUCore::JIT64 = 1`
+  - `CPUCore::JITARM64 = 4`
+  - `CPUCore::CachedInterpreter = 5`
+  - `CPUCore::StencilInterpreter = 6`
+- **Trap Encountered:**
+  - When invoking `divergence_detector.py`, running `--jit-core 1 --interp-core 1` tests upstream x86 JIT against itself, completely bypassing the new stencil interpreter.
+  - To test the new StencilInterpreter under lockstep parity, **always specify `--jit-core 6 --interp-core 5`**.
+  - Host binary `build/Binaries/dolphin-emu-nogui` must be rebuilt after modifying `StencilInterpreter.cpp` (`make -C build dolphin-nogui -j$(nproc)`).
+- **Triad Lockstep Mode (`--triad`):**
+  - Spawns three instances: Target (Core 6) + Ref 1 (Core 5) + Ref 2 (Core 5).
+  - If Ref 1 and Ref 2 diverge on an instruction (e.g., non-deterministic OS delay loops reading `mftb`/TimeBase, or asynchronous hardware timers), the script logs `[SKIP] DIVERGENT INSTRUCTION HYPOTHESIS` and skips past it without aborting execution.
+
+### 9.2 Critical AArch64 vs Gekko PowerPC Semantic Differences
+1. **The `ps_msub` / `fmsub` Sign Inversion Trap:**
+   - **Gekko PowerPC Definition:** $FD = (FA \times FC) - FB$.
+   - **AArch64 `fmsub` Definition:** `fmsub dD, dN, dM, dA` evaluates to $dA - (dN \times dM) = -((dN \times dM) - dA)$.
+   - Using `fmsub` in AArch64 produces the negated result ($-36$ instead of $+36$).
+   - **Solution:** Use AArch64 **`fnmsub`**, which evaluates to $(dN \times dM) - dA = (FA \times FC) - FB$.
+2. **3-Operand Gekko Packing Order:**
+   - In Gekko opcodes with 3 float/paired operands (`ps_madd`, `ps_msub`, `fmadds`, `fmsubs`, `fsel`):
+     ```text
+     packed = (FD << 24) | (FA << 16) | (FB << 8) | (FC)
+     ```
+   - Bits 24..28: $FD$ (Destination).
+   - Bits 16..20: $FA$ (First source / multiplier).
+   - Bits 8..12: $FB$ (Second source / addend or subtrahend).
+   - Bits 0..4: $FC$ (Third source / multiplier).
+3. **`fsel` Truth-Value Argument Mapping:**
+   - PowerPC: `fsel FD, FA, FC, FB` means `if (FA >= 0.0) FD = FC; else FD = FB;`.
+   - In AArch64: `fcmp d0, #0.0` followed by `fcsel d0, d1, d2, ge` ($d1 = FC, d2 = FB$).
+4. **`PairedSingle` Register Representation in Dolphin Memory:**
+   - In `PowerPCState.ps[32]`, each register is a 16-byte `PairedSingle` composed of two 64-bit IEEE doubles:
+     - `ps0` at offset `#0` (64 bits).
+     - `ps1` at offset `#8` (64 bits).
+   - **OP59 Single-Precision Scalar FP (`fadds`, `fsubs`, `fmuls`, `fdivs`, `fmadds`, `fmsubs`):**
+     - Reads `FA.ps0` and `FB.ps0` (and `FC.ps0`) as 64-bit doubles.
+     - Performs arithmetic, rounds result to single-precision float (`ForceSingle`), then converts back to 64-bit double.
+     - **CRITICAL:** Upstream Dolphin `fadds` executes `ppc_state.ps[FD].Fill(result);`, copying the result to **both** `ps0` and `ps1`.
+     - In assembly: `stp d0, d0, [x9]`. Never load a 32-bit `s` register directly from `[x7]` without loading the full double `d` and converting.
+
+### 9.3 Android GFX & Framebuffer Corruption (The Pink Screen Issue)
+- **Symptom:** Emulation displays a solid purple/magenta (`RGBA 183, 0, 236`) screen with a green line (`RGBA 0, 135, 0`) at the bottom.
+- **Root Cause:**
+  - GameCube Video Interface (VI) framebuffers in RAM are formatted in YUYV (BT.601).
+  - Uninitialized or uncopied RAM containing all `0xFF` bytes decodes under BT.601 YUV-to-RGB conversion as `Y=0, Cb=255, Cr=255 -> RGBA (178, 0, 225)` (magenta/purple). Memory containing `0x00` decodes as `Y=0, Cb=0, Cr=0 -> RGBA (0, 135, 0)` (green).
+  - Overriding `GFX.ini` with:
+    ```ini
+    [Hacks]
+    ImmediateXFBEnable = False
+    EFBToTextureEnable = True
+    FastDepthCalc = True
+    EFBAccessEnable = False
+    ```
+    breaks EFB-to-RAM copies that *The Legend of Zelda: Twilight Princess* requires for its external framebuffer (XFB).
+  - **Resolution:** Remove the corrupted `GFX.ini` override from `/sdcard/Android/data/org.dolphinemu.dolphinemu.debug/files/Config/GFX.ini` to let Dolphin use native XFB handling.
